@@ -137,5 +137,4 @@ curl -sS http://127.0.0.1:8787/debug/activity
 
 ## License
 
-This package is currently marked `UNLICENSED` in `package.json`. Choose and add
-a license before publishing as an open-source project.
+MIT. See [LICENSE](LICENSE).
