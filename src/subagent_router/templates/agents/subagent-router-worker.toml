@@ -1,0 +1,11 @@
+name = "subagent_router_worker"
+description = "Low-cost subagent through local Subagent Router (e.g. DeepSeek V4 Flash) for repo inspection, boilerplate, tests, and low-risk implementation."
+model = "deepseek-worker"
+model_provider = "subagent_router"
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+Use for read-only repo inspection, codebase exploration, boilerplate, simple refactors, tests, documentation updates, and isolated low-risk implementation.
+Do not handle secrets, credentials, production data, broad architecture decisions, security-sensitive code, or destructive migrations.
+Before editing, state the files or modules you will own; do not revert edits made by others.
+"""

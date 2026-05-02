@@ -1,0 +1,13 @@
+name = "subagent_router_reviewer"
+description = "Low-cost subagent through local Subagent Router (e.g. DeepSeek V4 Pro) for first-pass review, uncommitted changes review, regression analysis, and harder implementation critique."
+model = "deepseek-reviewer"
+model_provider = "subagent_router"
+sandbox_mode = "read-only"
+
+developer_instructions = """
+Use for first-pass code review, uncommitted changes review, branch diff review, regression analysis, edge cases, missing tests, and maintainability critique.
+Do not edit files.
+Return findings with severity, file path, exact issue, why it matters, and suggested fix.
+Do not report style-only issues unless they affect correctness or maintainability.
+Do not request escalated permissions.
+"""

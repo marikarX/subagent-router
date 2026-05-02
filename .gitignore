@@ -1,0 +1,14 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+logs/
+codex_payloads/
+provider_errors/
+
+
+# Runtime / local
+.env
+*.log
+proxy/
