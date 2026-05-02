@@ -158,6 +158,41 @@ class AppTests(unittest.TestCase):
         self.assertEqual(body["output"][0]["call_id"], "call_mock_1")
         self.assertFalse(body["end_turn"])
 
+    def test_response_items_drop_unadvertised_tool_calls(self):
+        chat_response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_allowed",
+                                "type": "function",
+                                "function": {"name": "exec_command", "arguments": "{}"},
+                            },
+                            {
+                                "id": "call_blocked",
+                                "type": "function",
+                                "function": {"name": "apply_patch", "arguments": "{}"},
+                            },
+                        ],
+                    }
+                }
+            ]
+        }
+
+        output, assistant_messages, _ = proxy_app.response_items_from_chat(
+            chat_response,
+            {"exec_command": proxy_app.ToolNameMapping(name="exec_command")},
+        )
+
+        self.assertEqual(len(output), 1)
+        self.assertEqual(output[0]["type"], "function_call")
+        self.assertEqual(output[0]["name"], "exec_command")
+        self.assertEqual(output[0]["call_id"], "call_allowed")
+        self.assertEqual(assistant_messages[0]["tool_calls"][0]["function"]["name"], "exec_command")
+
     def test_tool_call_response_preserves_reasoning_content_for_next_request(self):
         payload = {
             "model": "deepseek-reviewer",

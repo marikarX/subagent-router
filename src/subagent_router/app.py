@@ -549,7 +549,9 @@ def response_items_from_chat(
     for index, call in enumerate(tool_calls):
         function = call.get("function") or {}
         chat_name = str(function.get("name") or "")
-        mapping = tool_name_map.get(chat_name, ToolNameMapping(name=chat_name))
+        mapping = tool_name_map.get(chat_name)
+        if mapping is None:
+            continue
         call_id = str(call.get("id") or f"call_{uuid.uuid4().hex}")
         arguments = function.get("arguments")
         if not isinstance(arguments, str):
