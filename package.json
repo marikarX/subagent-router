@@ -1,6 +1,6 @@
 {
   "name": "subagent-router",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Route subagent work from primary coding agents to local, low-cost, or cloud model backends.",
   "type": "commonjs",
   "bin": {

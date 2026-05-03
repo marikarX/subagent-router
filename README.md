@@ -15,7 +15,7 @@ remains responsible for executing tools.
 From npm:
 
 ```shell
-npm install -g subagent-router
+(Not published yet) npm install -g subagent-router
 ```
 
 From source:
@@ -31,7 +31,7 @@ For local npm package testing from this checkout:
 
 ```shell
 npm pack
-npm install -g ./subagent-router-0.1.0.tgz
+npm install -g ./subagent-router-0.1.2.tgz
 ```
 
 ## Quick Start
@@ -50,13 +50,26 @@ subagent-router init
 ```
 
 Default init mode writes the full Subagent Router delegation instructions to
-`~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md` and adds only that file path as the first line of
+`~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md` and adds
+`Follow instructions in ~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md` as the first line of
 `~/.codex/AGENTS.md`. Existing `AGENTS.md` content stays below it.
+
+
 
 Start the proxy:
 
 ```shell
 DEEPSEEK_API_KEY=... subagent-router start
+```
+
+Start it in the background and attach logs when needed:
+
+```shell
+DEEPSEEK_API_KEY=... subagent-router start --background
+subagent-router logs --follow
+subagent-router status
+subagent-router restart
+subagent-router stop
 ```
 
 For deterministic local smoke tests without a DeepSeek key:
@@ -80,6 +93,11 @@ the command exits.
 ```shell
 subagent-router init
 subagent-router start
+subagent-router start --background
+subagent-router stop
+subagent-router restart
+subagent-router status
+subagent-router logs --follow
 subagent-router run -- codex ...
 subagent-router doctor
 subagent-router paths

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import json
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -47,12 +49,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="subagent-router",
         description="Manage the local Subagent Router.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""common workflows:
+  subagent-router start --background
+  subagent-router start --background --attach-logs
+  subagent-router logs --follow
+  subagent-router restart
+  subagent-router stop
+  subagent-router version
+  subagent-router run -- codex ...
+""",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     start = subcommands.add_parser("start", help="start the local HTTP proxy")
     add_common_settings_args(start)
+    start.add_argument("--background", action="store_true", help="start in the background")
+    start.add_argument(
+        "--attach-logs",
+        action="store_true",
+        help="with --background, attach to the server log after startup",
+    )
     start.set_defaults(handler=cmd_start)
+
+    stop = subcommands.add_parser("stop", help="stop a background proxy")
+    add_common_settings_args(stop)
+    stop.add_argument("--timeout", type=float, default=5.0, help="seconds to wait for graceful stop")
+    stop.add_argument("--force", action="store_true", help="kill the process if it does not stop")
+    stop.set_defaults(handler=cmd_stop)
+
+    restart = subcommands.add_parser("restart", help="restart a background proxy")
+    add_common_settings_args(restart)
+    restart.add_argument("--timeout", type=float, default=5.0, help="seconds to wait for graceful stop")
+    restart.add_argument("--force", action="store_true", help="kill the process if it does not stop")
+    restart.add_argument(
+        "--attach-logs",
+        action="store_true",
+        help="attach to the server log after restart",
+    )
+    restart.set_defaults(handler=cmd_restart)
+
+    status = subcommands.add_parser("status", help="print background proxy status")
+    add_common_settings_args(status)
+    status.set_defaults(handler=cmd_status)
+
+    logs = subcommands.add_parser("logs", help="print or follow the background proxy log")
+    add_common_settings_args(logs)
+    logs.add_argument("-f", "--follow", action="store_true", help="follow log output")
+    logs.add_argument("--lines", type=int, default=80, help="number of trailing lines to print")
+    logs.set_defaults(handler=cmd_logs)
 
     run = subcommands.add_parser("run", help="start the proxy for one command")
     add_common_settings_args(run)
@@ -63,6 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_settings_args(paths)
     paths.add_argument("--json", action="store_true", help="print JSON")
     paths.set_defaults(handler=cmd_paths)
+
+    version = subcommands.add_parser("version", help="print the package version")
+    version.add_argument("--json", action="store_true", help="print JSON")
+    version.set_defaults(handler=cmd_version)
 
     doctor = subcommands.add_parser("doctor", help="check local proxy configuration")
     add_common_settings_args(doctor)
@@ -147,6 +196,11 @@ def settings_from_args(args: argparse.Namespace, *, ephemeral_port: bool = False
 
 def cmd_start(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
+    if args.background:
+        return start_background(args, settings)
+    if args.attach_logs:
+        print("start: --attach-logs requires --background", file=sys.stderr)
+        return 2
     saved = {}
     proxy_env = settings.as_env(include_secrets=True)
     for key, value in proxy_env.items():
@@ -161,6 +215,40 @@ def cmd_start(args: argparse.Namespace) -> int:
             else:
                 os.environ[key] = saved[key]
     return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    settings = settings_from_args(args)
+    return stop_background(settings, timeout=args.timeout, force=args.force, quiet=False)
+
+
+def cmd_restart(args: argparse.Namespace) -> int:
+    settings = settings_from_args(args)
+    stop_background(settings, timeout=args.timeout, force=args.force, quiet=True)
+    return start_background(args, settings)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    settings = settings_from_args(args)
+    pid = read_pid(settings)
+    if pid is None:
+        print("Subagent Router is not running.")
+        return 1
+    if not process_running(pid):
+        pid_file(settings).unlink(missing_ok=True)
+        print(f"Subagent Router is not running (removed stale pid {pid}).")
+        return 1
+    print(f"Subagent Router is running (pid {pid}) at http://{settings.host}:{settings.port}/v1")
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    settings = settings_from_args(args)
+    path = server_log_file(settings)
+    if not path.exists():
+        print(f"No server log found at {path}", file=sys.stderr)
+        return 1
+    return print_log(path, lines=args.lines, follow=args.follow)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -199,6 +287,103 @@ def cmd_run(args: argparse.Namespace) -> int:
             proxy_proc.wait()
 
 
+def start_background(args: argparse.Namespace, settings: Settings) -> int:
+    pid_path = pid_file(settings)
+    existing_pid = read_pid(settings)
+    if existing_pid is not None:
+        if process_running(existing_pid):
+            print(f"Subagent Router is already running (pid {existing_pid}).", file=sys.stderr)
+            return 1
+        pid_path.unlink(missing_ok=True)
+
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    log_path = server_log_file(settings)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    proxy_env = {**os.environ, **settings.as_env(include_secrets=True)}
+    command = [sys.executable, "-m", "subagent_router.cli", "start"]
+
+    with log_path.open("ab", buffering=0) as log_handle:
+        proc = subprocess.Popen(
+            command,
+            env=proxy_env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
+    try:
+        wait_for_health(settings)
+        ensure_background_child_running(proc, pid_path, log_path)
+    except Exception as exc:
+        if proc.poll() is None:
+            proc.terminate()
+        pid_path.unlink(missing_ok=True)
+        print(f"Subagent Router failed to start: {exc}", file=sys.stderr)
+        print(f"Log: {log_path}", file=sys.stderr)
+        return 1
+
+    print(f"Started Subagent Router (pid {proc.pid}) at http://{settings.host}:{settings.port}/v1")
+    print(f"Log: {log_path}")
+    if args.attach_logs:
+        return print_log(log_path, lines=40, follow=True)
+    return 0
+
+
+def stop_background(settings: Settings, *, timeout: float, force: bool, quiet: bool) -> int:
+    pid_path = pid_file(settings)
+    pid = read_pid(settings)
+    if pid is None:
+        if not quiet:
+            print("Subagent Router is not running.")
+        return 0
+    if not process_running(pid):
+        pid_path.unlink(missing_ok=True)
+        if not quiet:
+            print(f"Subagent Router is not running (removed stale pid {pid}).")
+        return 0
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pid_path.unlink(missing_ok=True)
+        if not quiet:
+            print(f"Subagent Router is not running (removed stale pid {pid}).")
+        return 0
+    except PermissionError:
+        print(f"Permission denied while stopping Subagent Router (pid {pid}).", file=sys.stderr)
+        return 1
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_running(pid):
+            pid_path.unlink(missing_ok=True)
+            if not quiet:
+                print(f"Stopped Subagent Router (pid {pid}).")
+            return 0
+        time.sleep(0.1)
+
+    if force:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pid_path.unlink(missing_ok=True)
+            if not quiet:
+                print(f"Subagent Router is not running (removed stale pid {pid}).")
+            return 0
+        except PermissionError:
+            print(f"Permission denied while killing Subagent Router (pid {pid}).", file=sys.stderr)
+            return 1
+        pid_path.unlink(missing_ok=True)
+        if not quiet:
+            print(f"Killed Subagent Router (pid {pid}).")
+        return 0
+
+    print(f"Subagent Router did not stop within {timeout:g}s (pid {pid}).", file=sys.stderr)
+    print("Use --force to kill it.", file=sys.stderr)
+    return 1
+
+
 def cmd_paths(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     if args.json:
@@ -224,6 +409,15 @@ def cmd_paths(args: argparse.Namespace) -> int:
         print(f"mock_deepseek: {settings.mock_deepseek}")
         print(f"allow_apply_patch: {settings.allow_apply_patch}")
         print(f"trace_enabled: {settings.trace_enabled}")
+    return 0
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    package_version = _pkg_version_str()
+    if args.json:
+        print(json.dumps({"version": package_version}))
+    else:
+        print(package_version)
     return 0
 
 
@@ -290,12 +484,20 @@ def _init_default(
 
     # Reference the instructions file from AGENTS.md.
     agents_path = codex_home / "AGENTS.md"
-    ref_line = f"{system_file.resolve()}"
+    instruction_path = system_file.resolve()
+    ref_line = f"Follow instructions in {instruction_path}"
+    legacy_ref_line = f"{instruction_path}"
     if agents_path.exists():
         existing = agents_path.read_text(encoding="utf-8")
         lines = existing.splitlines()
         if lines and lines[0] == ref_line:
             pass  # already present
+        elif lines and lines[0] == legacy_ref_line:
+            trailing_newline = "\n" if existing.endswith("\n") else ""
+            agents_path.write_text(
+                f"{ref_line}\n" + "\n".join(lines[1:]) + trailing_newline,
+                encoding="utf-8",
+            )
         else:
             agents_path.write_text(f"{ref_line}\n{existing}", encoding="utf-8")
     else:
@@ -588,6 +790,66 @@ def wait_for_health(settings: Settings, timeout: float = 15.0) -> None:
             last_error = exc
         time.sleep(0.1)
     raise RuntimeError(f"proxy did not become healthy at {url}: {last_error}")
+
+
+def ensure_background_child_running(proc: subprocess.Popen, pid_path: Path, log_path: Path) -> None:
+    time.sleep(0.2)
+    return_code = proc.poll()
+    if return_code is None:
+        return
+    pid_path.unlink(missing_ok=True)
+    raise RuntimeError(f"proxy process exited early with status {return_code}; see {log_path}")
+
+
+def pid_file(settings: Settings) -> Path:
+    return settings.state_dir / "subagent-router.pid"
+
+
+def server_log_file(settings: Settings) -> Path:
+    return settings.state_dir / "logs" / "server.log"
+
+
+def read_pid(settings: Settings) -> int | None:
+    path = pid_file(settings)
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        path.unlink(missing_ok=True)
+        return None
+
+
+def process_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def print_log(path: Path, *, lines: int, follow: bool) -> int:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        if lines > 0:
+            for line in deque(handle, maxlen=lines):
+                print(line, end="")
+        else:
+            handle.seek(0, os.SEEK_END)
+
+        if not follow:
+            return 0
+
+        try:
+            while True:
+                line = handle.readline()
+                if line:
+                    print(line, end="")
+                else:
+                    time.sleep(0.2)
+        except KeyboardInterrupt:
+            return 130
 
 
 def free_loopback_port(host: str) -> int:

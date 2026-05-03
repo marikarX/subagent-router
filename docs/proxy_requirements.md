@@ -88,7 +88,7 @@ curl -sS http://127.0.0.1:8787/debug/paths
 
 `subagent-router init` installs Codex integration files. Default mode writes full
 delegation instructions to `SUBAGENT_ROUTER_INSTRUCTIONS.md` and references that file from the top of
-`AGENTS.md`, without embedding the full instructions in `AGENTS.md`.
+`AGENTS.md` with `Follow instructions in ...`, without embedding the full instructions in `AGENTS.md`.
 
 See [usage.md](usage.md) for mode details.
 

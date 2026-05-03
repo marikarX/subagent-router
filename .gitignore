@@ -12,3 +12,4 @@ provider_errors/
 .env
 *.log
 proxy/
+*.tgz

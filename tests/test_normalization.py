@@ -310,6 +310,41 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(normalized.messages[0]["tool_calls"][0]["id"], "call_123")
         self.assertEqual(normalized.messages[1], {"role": "tool", "tool_call_id": "call_123", "content": "ok"})
 
+    def test_parallel_tool_call_loop_groups_calls_before_outputs(self):
+        normalized = normalize_request(
+            {
+                "model": "deepseek-chat",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": "cat /home/danat/.codex/RTK.md"}),
+                        "call_id": "call_1",
+                    },
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": "cat /home/danat/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md"}),
+                        "call_id": "call_2",
+                    },
+                    {"type": "function_call_output", "call_id": "call_1", "output": "rtk output"},
+                    {"type": "function_call_output", "call_id": "call_2", "output": "router output"},
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "continue"}],
+                    },
+                ],
+                "tools": [],
+            }
+        )
+
+        self.assertEqual(normalized.messages[0]["role"], "assistant")
+        self.assertEqual([tc["id"] for tc in normalized.messages[0]["tool_calls"]], ["call_1", "call_2"])
+        self.assertEqual(normalized.messages[1], {"role": "tool", "tool_call_id": "call_1", "content": "rtk output"})
+        self.assertEqual(normalized.messages[2], {"role": "tool", "tool_call_id": "call_2", "content": "router output"})
+        self.assertEqual(normalized.messages[3]["role"], "user")
+
     def test_replayed_function_call_reattaches_reasoning_content(self):
         normalized = normalize_request(
             {
@@ -436,6 +471,37 @@ class NormalizationTests(unittest.TestCase):
         )
 
         self.assertEqual(normalized.messages[-1], {"role": "tool", "tool_call_id": "call_123", "content": "ok"})
+
+    def test_previous_response_state_does_not_reopen_completed_tool_calls(self):
+        normalized = normalize_request(
+            {
+                "model": "deepseek-chat",
+                "previous_response_id": "resp_1",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "continue"}],
+                    }
+                ],
+            },
+            previous_messages=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {"name": "exec_command", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_123", "content": "ok"},
+            ],
+        )
+
+        self.assertEqual(normalized.messages[-1]["role"], "user")
 
     def test_tool_output_without_prior_call_fails(self):
         with self.assertRaises(PayloadNormalizationError):

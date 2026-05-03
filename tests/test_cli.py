@@ -3,9 +3,11 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import Mock
 
 from subagent_router import cli
 from subagent_router.settings import Settings
@@ -43,8 +45,13 @@ class CliTests(unittest.TestCase):
 
             root = Path(codex_home)
             self.assertEqual(result, 0)
-            self.assertIn("standing user authorization", (root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").read_text())
-            self.assertEqual((root / "AGENTS.md").read_text().splitlines()[0], str((root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").resolve()))
+            instructions = (root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").read_text()
+            self.assertIn("standing user authorization", instructions)
+            self.assertIn("Read every instruction file path listed in the active `AGENTS.md`", instructions)
+            self.assertEqual(
+                (root / "AGENTS.md").read_text().splitlines()[0],
+                f"Follow instructions in {(root / 'SUBAGENT_ROUTER_INSTRUCTIONS.md').resolve()}",
+            )
             self.assertFalse((root / "skills" / "deepseek" / "SKILL.md").exists())
             self.assertFalse((root / "slash_commands" / "deepseek.md").exists())
             self.assertIn("subagent_router_worker", (root / "agents" / "subagent-router-worker.toml").read_text())
@@ -63,8 +70,23 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             lines = agents_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(lines[0], str((root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").resolve()))
+            self.assertEqual(lines[0], f"Follow instructions in {(root / 'SUBAGENT_ROUTER_INSTRUCTIONS.md').resolve()}")
             self.assertIn("/home/example/OTHER.md", lines)
+            self.assertIn("Keep me.", lines)
+
+    def test_init_default_replaces_legacy_bare_router_path(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            agents_path = root / "AGENTS.md"
+            legacy_path = (root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").resolve()
+            agents_path.write_text(f"{legacy_path}\n\n# Existing\nKeep me.\n", encoding="utf-8")
+
+            result = cli.main(["init", "--codex-home", codex_home])
+
+            self.assertEqual(result, 0)
+            lines = agents_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0], f"Follow instructions in {legacy_path}")
+            self.assertNotIn(str(legacy_path), lines[1:])
             self.assertIn("Keep me.", lines)
 
     def test_init_opt_in_installs_skill_and_slash_without_global_instructions(self):
@@ -114,6 +136,213 @@ class CliTests(unittest.TestCase):
         result = cli.main(["run", "--"])
 
         self.assertEqual(result, 2)
+
+    def test_top_level_help_lists_background_lifecycle_examples(self):
+        help_text = cli.build_parser().format_help()
+
+        self.assertIn("subagent-router start --background", help_text)
+        self.assertIn("subagent-router start --background --attach-logs", help_text)
+        self.assertIn("subagent-router logs --follow", help_text)
+        self.assertIn("subagent-router restart", help_text)
+        self.assertIn("subagent-router stop", help_text)
+        self.assertIn("subagent-router version", help_text)
+
+    def test_version_command_prints_package_version(self):
+        stream = io.StringIO()
+
+        with redirect_stdout(stream):
+            result = cli.main(["version"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stream.getvalue(), f"{cli._pkg_version_str()}\n")
+
+    def test_version_command_prints_json(self):
+        stream = io.StringIO()
+
+        with redirect_stdout(stream):
+            result = cli.main(["version", "--json"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(stream.getvalue()), {"version": cli._pkg_version_str()})
+
+    @patch("subagent_router.cli.wait_for_health")
+    @patch("subagent_router.cli.subprocess.Popen")
+    def test_start_background_writes_pid_and_log_path(self, mock_popen, mock_wait):
+        proc = Mock()
+        proc.pid = 12345
+        proc.poll.return_value = None
+        mock_popen.return_value = proc
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            result = cli.main(["start", "--state-dir", state_dir, "--mock", "--background"])
+            root = Path(state_dir)
+
+            self.assertEqual(result, 0)
+            self.assertEqual((root / "subagent-router.pid").read_text(encoding="utf-8"), "12345\n")
+            self.assertTrue((root / "logs" / "server.log").exists())
+
+        command = mock_popen.call_args.args[0]
+        kwargs = mock_popen.call_args.kwargs
+        self.assertEqual(command, [os.sys.executable, "-m", "subagent_router.cli", "start"])
+        self.assertEqual(kwargs["env"]["DEEPSEEK_PROXY_MOCK"], "1")
+        self.assertEqual(kwargs["stdin"], cli.subprocess.DEVNULL)
+        self.assertTrue(kwargs["start_new_session"])
+
+    @patch("subagent_router.cli.wait_for_health", side_effect=RuntimeError("not healthy"))
+    @patch("subagent_router.cli.subprocess.Popen")
+    def test_start_background_cleans_pid_when_health_check_fails(self, mock_popen, mock_wait):
+        proc = Mock()
+        proc.pid = 12345
+        proc.poll.return_value = None
+        mock_popen.return_value = proc
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            result = cli.main(["start", "--state-dir", state_dir, "--mock", "--background"])
+
+            self.assertEqual(result, 1)
+            self.assertFalse((Path(state_dir) / "subagent-router.pid").exists())
+            proc.terminate.assert_called_once()
+
+    @patch("subagent_router.cli.wait_for_health")
+    @patch("subagent_router.cli.subprocess.Popen")
+    def test_start_background_fails_when_child_exits_after_health_check(self, mock_popen, mock_wait):
+        proc = Mock()
+        proc.pid = 12345
+        proc.poll.return_value = 1
+        mock_popen.return_value = proc
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            result = cli.main(["start", "--state-dir", state_dir, "--mock", "--background"])
+
+            self.assertEqual(result, 1)
+            self.assertFalse((Path(state_dir) / "subagent-router.pid").exists())
+
+    @patch("subagent_router.cli.os.kill")
+    def test_stop_removes_pid_after_process_exits(self, mock_kill):
+        with tempfile.TemporaryDirectory() as state_dir:
+            pid_path = Path(state_dir) / "subagent-router.pid"
+            pid_path.write_text("12345\n", encoding="utf-8")
+
+            def fake_kill(pid, sig):
+                if sig == 0 and fake_kill.checks > 0:
+                    raise ProcessLookupError()
+                fake_kill.checks += 1
+
+            fake_kill.checks = 0
+            mock_kill.side_effect = fake_kill
+
+            result = cli.main(["stop", "--state-dir", state_dir, "--timeout", "0.2"])
+
+            self.assertEqual(result, 0)
+            self.assertFalse(pid_path.exists())
+            mock_kill.assert_any_call(12345, cli.signal.SIGTERM)
+
+    @patch("subagent_router.cli.os.kill")
+    def test_stop_removes_pid_when_sigterm_races_with_exit(self, mock_kill):
+        def fake_kill(pid, sig):
+            if sig == 0:
+                return None
+            raise ProcessLookupError()
+
+        mock_kill.side_effect = fake_kill
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            pid_path = Path(state_dir) / "subagent-router.pid"
+            pid_path.write_text("12345\n", encoding="utf-8")
+
+            result = cli.main(["stop", "--state-dir", state_dir])
+
+            self.assertEqual(result, 0)
+            self.assertFalse(pid_path.exists())
+            mock_kill.assert_any_call(12345, cli.signal.SIGTERM)
+
+    @patch("subagent_router.cli.os.kill")
+    def test_stop_reports_permission_denied_for_sigterm(self, mock_kill):
+        def fake_kill(pid, sig):
+            if sig == 0:
+                return None
+            raise PermissionError()
+
+        mock_kill.side_effect = fake_kill
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            (Path(state_dir) / "subagent-router.pid").write_text("12345\n", encoding="utf-8")
+            stream = io.StringIO()
+
+            with redirect_stderr(stream):
+                result = cli.main(["stop", "--state-dir", state_dir])
+
+        self.assertEqual(result, 1)
+        self.assertIn("Permission denied", stream.getvalue())
+
+    @patch("subagent_router.cli.process_running", return_value=True)
+    def test_start_background_refuses_existing_running_pid(self, mock_running):
+        with tempfile.TemporaryDirectory() as state_dir:
+            (Path(state_dir) / "subagent-router.pid").write_text("12345\n", encoding="utf-8")
+
+            result = cli.main(["start", "--state-dir", state_dir, "--mock", "--background"])
+
+        self.assertEqual(result, 1)
+
+    @patch("subagent_router.cli.process_running", return_value=True)
+    def test_status_reports_running_process(self, mock_running):
+        with tempfile.TemporaryDirectory() as state_dir:
+            (Path(state_dir) / "subagent-router.pid").write_text("12345\n", encoding="utf-8")
+            stream = io.StringIO()
+
+            with redirect_stdout(stream):
+                result = cli.main(["status", "--state-dir", state_dir, "--host", "127.0.0.1", "--port", "9999"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("pid 12345", stream.getvalue())
+        self.assertIn("http://127.0.0.1:9999/v1", stream.getvalue())
+
+    @patch("subagent_router.cli.process_running", return_value=False)
+    def test_status_removes_stale_pid(self, mock_running):
+        with tempfile.TemporaryDirectory() as state_dir:
+            pid_path = Path(state_dir) / "subagent-router.pid"
+            pid_path.write_text("12345\n", encoding="utf-8")
+            stream = io.StringIO()
+
+            with redirect_stdout(stream):
+                result = cli.main(["status", "--state-dir", state_dir])
+
+            self.assertEqual(result, 1)
+            self.assertFalse(pid_path.exists())
+            self.assertIn("removed stale pid 12345", stream.getvalue())
+
+    def test_status_reports_missing_pid(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            stream = io.StringIO()
+
+            with redirect_stdout(stream):
+                result = cli.main(["status", "--state-dir", state_dir])
+
+        self.assertEqual(result, 1)
+        self.assertIn("not running", stream.getvalue())
+
+    def test_logs_reports_missing_log_file(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            stream = io.StringIO()
+
+            with redirect_stderr(stream):
+                result = cli.main(["logs", "--state-dir", state_dir])
+
+        self.assertEqual(result, 1)
+        self.assertIn("No server log found", stream.getvalue())
+
+    def test_logs_prints_trailing_lines(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            log_path = Path(state_dir) / "logs" / "server.log"
+            log_path.parent.mkdir(parents=True)
+            log_path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+            stream = io.StringIO()
+
+            with redirect_stdout(stream):
+                result = cli.main(["logs", "--state-dir", state_dir, "--lines", "2"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stream.getvalue(), "two\nthree\n")
 
     @patch("uvicorn.run")
     def test_cmd_start_restores_process_environment(self, mock_uvicorn_run):

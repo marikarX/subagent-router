@@ -20,7 +20,7 @@ To test the npm package before publishing:
 
 ```shell
 npm pack
-npm install -g ./subagent-router-0.1.0.tgz
+npm install -g ./subagent-router-0.1.2.tgz
 ```
 
 The npm package exposes both `subagent-router` and the short `sar` alias.
@@ -36,7 +36,7 @@ subagent-router init
 Default mode writes:
 
 - `~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md`
-- a single absolute `SUBAGENT_ROUTER_INSTRUCTIONS.md` path line at the top of `~/.codex/AGENTS.md`
+- `Follow instructions in ~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md` at the top of `~/.codex/AGENTS.md`
 - `~/.codex/agents/subagent-router-worker.toml`
 - `~/.codex/agents/subagent-router-reviewer.toml`
 - a managed `subagent_router` provider block in `~/.codex/config.toml`
@@ -68,6 +68,31 @@ Run with deterministic mock responses:
 
 ```shell
 subagent-router start --mock
+```
+
+Run in the background:
+
+```shell
+DEEPSEEK_API_KEY=... subagent-router start --background
+```
+
+The background process writes its PID to
+`$SUBAGENT_ROUTER_STATE_DIR/subagent-router.pid` and server output to
+`$SUBAGENT_ROUTER_STATE_DIR/logs/server.log`.
+
+Lifecycle commands:
+
+```shell
+subagent-router status
+subagent-router logs --follow
+subagent-router restart
+subagent-router stop
+```
+
+To start the proxy and immediately attach the terminal to its logs:
+
+```shell
+DEEPSEEK_API_KEY=... subagent-router start --background --attach-logs
 ```
 
 Run one command with an ephemeral proxy:

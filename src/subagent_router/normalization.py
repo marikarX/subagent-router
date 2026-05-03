@@ -204,10 +204,23 @@ def normalize_input_items(
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     pending_call_ids = set(initial_pending_call_ids or {})
+    queued_tool_calls: list[dict[str, Any]] = []
+
+    def flush_queued_tool_calls() -> None:
+        if not queued_tool_calls:
+            return
+        messages.append(
+            chat_assistant_message(
+                list(queued_tool_calls),
+                reasoning_content_by_call_id=reasoning_content_by_call_id,
+            )
+        )
+        queued_tool_calls.clear()
 
     for item in items:
         item_type = item.get("type")
         if item_type == "message":
+            flush_queued_tool_calls()
             if pending_call_ids:
                 raise PayloadNormalizationError(
                     f"message after pending tool calls without matching tool output: {pending_call_ids}"
@@ -219,28 +232,41 @@ def normalize_input_items(
                     msg["reasoning_content"] = reasoning_content_by_assistant_text[text]
             messages.append(msg)
         elif item_type in ("function_call", "mcp_tool_call"):
+            if pending_call_ids and not queued_tool_calls:
+                raise PayloadNormalizationError(
+                    f"tool call after pending tool calls without matching tool output: {pending_call_ids}"
+                )
             tool_calls = tool_call_to_chat_tool_calls(item, item_type)
-            messages.append(
-                chat_assistant_message(tool_calls, reasoning_content_by_call_id=reasoning_content_by_call_id)
-            )
+            queued_tool_calls.extend(tool_calls)
             for tc in tool_calls:
                 pending_call_ids.add(tc["id"])
         elif item_type == "custom_tool_call":
+            if pending_call_ids and not queued_tool_calls:
+                raise PayloadNormalizationError(
+                    f"tool call after pending tool calls without matching tool output: {pending_call_ids}"
+                )
             custom_tool_call = custom_tool_call_to_chat_tool_call(item)
-            messages.append(chat_assistant_message([custom_tool_call]))
+            queued_tool_calls.append(custom_tool_call)
             pending_call_ids.add(custom_tool_call["id"])
         elif item_type == "local_shell_call":
+            if pending_call_ids and not queued_tool_calls:
+                raise PayloadNormalizationError(
+                    f"tool call after pending tool calls without matching tool output: {pending_call_ids}"
+                )
             ls_call = local_shell_call_to_chat_tool_call(item)
-            messages.append(chat_assistant_message([ls_call]))
+            queued_tool_calls.append(ls_call)
             pending_call_ids.add(ls_call["id"])
         elif item_type in ("function_call_output", "custom_tool_call_output", "mcp_tool_call_output"):
+            flush_queued_tool_calls()
             tool_output = normalize_tool_output(item, pending_call_ids)
             messages.append(tool_output)
         elif item_type == "tool_search_output":
+            flush_queued_tool_calls()
             messages.append(normalize_tool_output(item, pending_call_ids))
         else:
             raise PayloadNormalizationError(f"unsupported input item type: {item_type!r}")
 
+    flush_queued_tool_calls()
     return messages
 
 
@@ -481,4 +507,8 @@ def pending_tool_call_ids(messages: list[dict[str, Any]]) -> set[str]:
             for tc in tool_calls:
                 if isinstance(tc, dict):
                     ids.add(str(tc.get("id", "")))
+        if msg.get("role") == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                ids.discard(str(tool_call_id))
     return ids
