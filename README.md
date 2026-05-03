@@ -15,7 +15,7 @@ remains responsible for executing tools.
 From npm:
 
 ```shell
-(Not published yet) npm install -g subagent-router
+npm install -g subagent-router
 ```
 
 From source:
