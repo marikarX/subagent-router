@@ -67,6 +67,13 @@ If `session_mirror.final` contains messages but Codex did not surface a final
 agent result, report the mirrored final messages and stop instead of silently
 continuing locally.
 
+If `wait_agent` returns a final or complete response that is empty, null, or
+only a progress line such as `Now I'll fix both call sites:`, send `continue`
+or a concise instruction to the same agent with `send_input` asking it to finish
+with changed files, tests run, and results. Wait once more. If the agent repeats
+invalid final output, stop and report the trace id plus sanitized
+`session_mirror.latest`/`session_mirror.final` details.
+
 ## Tool Filtering
 
 The proxy forwards supported function tools only.
@@ -76,6 +83,7 @@ The proxy forwards supported function tools only.
 - `apply_patch` is dropped for read-only reviewer requests.
 - `apply_patch` is preserved for the `deepseek-worker` alias, write-capable
   metadata, or `DEEPSEEK_ALLOW_APPLY_PATCH=1`.
+- Write-capable worker aliases keep `apply_patch` by default.
 
 ## Thinking-Mode Continuations
 
@@ -86,3 +94,31 @@ to Codex and is omitted from diagnostics.
 
 If this fails after a proxy restart, retry the request from the beginning; the
 MVP continuation cache is not durable.
+
+## Budget Exceeded (402 Payment Required)
+
+If the proxy returns a `402 Payment Required` error, it means a configured budget limit has been reached in `hard-stop` mode.
+
+1. **Check usage**:
+   ```shell
+   subagent-router usage
+   ```
+2. **Identify the limit**:
+   Review your `config.toml` or environment variables for `MAX_COST_*` or `MAX_TOKENS_*` settings.
+3. **Reset daily limits**:
+   Daily limits reset at 00:00 UTC. If you need to override for the rest of the day, increase the limit in your configuration and restart the proxy.
+4. **Temporary override**:
+   You can start the proxy with a higher limit for a single session:
+   ```shell
+   SUBAGENT_ROUTER_MAX_COST_PER_DAY=10.00 subagent-router restart
+   ```
+
+## Debug Bundle
+
+If you need to report an issue without exposing secrets:
+
+```shell
+subagent-router debug-bundle
+```
+
+This creates a `subagent-router-debug-*.tar.gz` archive containing logs and diagnostics with sensitive headers and prompt content redacted.

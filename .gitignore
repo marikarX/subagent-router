@@ -13,3 +13,5 @@ provider_errors/
 *.log
 proxy/
 *.tgz
+scripts/local-*.sh
+scratch/

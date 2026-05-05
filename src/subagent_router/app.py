@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
+import re
+import threading
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -23,7 +27,11 @@ from .normalization import (
     normalize_request,
     redact,
 )
-from .settings import Settings
+from .providers import Provider, ProviderConfig, ProviderResponse
+from .providers.deepseek import DeepSeekProvider, MockDeepSeekProvider
+from .providers.ollama import OllamaProvider
+from .providers.openai_compat import OpenAICompatibleProvider
+from .settings import ProviderHealthMetadata, Settings
 
 
 SETTINGS = Settings.from_env()
@@ -36,6 +44,7 @@ RESPONSE_STATES: dict[str, list[dict[str, Any]]] = {}
 REASONING_CONTENT_BY_CALL_ID: dict[str, str] = {}
 REASONING_CONTENT_BY_ASSISTANT_TEXT: dict[str, str] = {}
 MAX_RESPONSE_STATES = 100
+USAGE_LOCK = threading.Lock()
 SESSION_EVENTS: list[dict[str, Any]] = []
 ACTIVITY_STATE: dict[str, Any] = {
     "started_at": None,
@@ -47,11 +56,23 @@ ACTIVITY_STATE: dict[str, Any] = {
     "error_count": 0,
     "last_trace_id": None,
     "last_model": None,
+    "last_provider": None,
     "last_output_kind": None,
     "last_end_turn": None,
+    "requests_by_provider": {},
+    "requests_by_model": {},
+    "errors_by_provider": {},
+    "local_request_count": 0,
+    "cloud_request_count": 0,
+    "fallback_count": 0,
+    "total_latency_ms": 0,
+    "average_latency_ms": 0,
+    "total_cost_usd": 0.0,
+    "total_tokens": 0,
 }
 
 
+@app.post("/v1/chat/completions", response_model=None)
 @app.post("/v1/responses", response_model=None)
 async def create_response(request: Request) -> JSONResponse | StreamingResponse:
     trace_id = uuid.uuid4().hex[:8]
@@ -75,47 +96,173 @@ async def create_response(request: Request) -> JSONResponse | StreamingResponse:
     previous_response_id = payload.get("previous_response_id")
     previous_messages = RESPONSE_STATES.get(str(previous_response_id)) if previous_response_id else None
 
+    # Translate OpenAI-style 'messages' to Codex 'input' format if needed
+    if "messages" in payload and "input" not in payload:
+        payload["input"] = [
+            {"type": "message", "role": msg.get("role", "user"), "content": [{"type": "input_text", "text": msg.get("content", "")}]}
+            for msg in payload["messages"]
+        ]
+
     try:
         normalized = normalize_request(
             payload,
             previous_messages=previous_messages,
             reasoning_content_by_call_id=REASONING_CONTENT_BY_CALL_ID,
             reasoning_content_by_assistant_text=REASONING_CONTENT_BY_ASSISTANT_TEXT,
-            allow_apply_patch_enabled=SETTINGS.allow_apply_patch,
+            allow_apply_patch_enabled=SETTINGS.apply_patch_override(),
         )
     except PayloadNormalizationError as exc:
         record_activity("error", trace_id=trace_id)
         trace_line(trace_id, f"normalize_error status=400 message={preview_text(str(exc))}")
         return error_response(str(exc), status_code=400)
 
-    record_activity("request", trace_id=trace_id, model=normalized.requested_model)
+    route = select_route(request, payload)
+    record_activity("request", trace_id=trace_id, model=normalized.requested_model, provider=route.provider)
     trace_request(trace_id, normalized)
 
+    if budget_hard_stop_for_session(float(ACTIVITY_STATE.get("total_cost_usd", 0.0)), int(ACTIVITY_STATE.get("total_tokens", 0))):
+        record_activity("error", trace_id=trace_id, provider=route.provider)
+        return error_response("session budget exceeded", status_code=402)
+    if budget_hard_stop_for_day():
+        record_activity("error", trace_id=trace_id, provider=route.provider)
+        return error_response("daily budget exceeded", status_code=402)
+
+    provider_result: ProviderResponse | None = None
+    started = time.monotonic()
     try:
-        chat_response = await call_deepseek(normalized)
+        if SETTINGS.dry_run or payload.get("dry_run") is True:
+            provider_result = dry_run_provider_response(normalized, route)
+        else:
+            provider_result = await call_provider(normalized, route)
     except httpx.HTTPStatusError as exc:
-        record_activity("error", trace_id=trace_id)
+        record_activity("error", trace_id=trace_id, provider=route.provider)
         path = log_provider_error(normalized, exc.response)
         message = safe_provider_error(exc.response)
+        write_failed_attempt_audit(trace_id, route, message, exc.response.status_code)
         trace_line(
             trace_id,
             f"provider_error status={exc.response.status_code} message={preview_text(message)} diagnostic={path}",
         )
         return error_response(message, status_code=exc.response.status_code)
     except httpx.HTTPError as exc:
-        record_activity("error", trace_id=trace_id)
+        record_activity("error", trace_id=trace_id, provider=route.provider)
+        write_failed_attempt_audit(trace_id, route, str(exc), 502)
         trace_line(trace_id, f"transport_error status=502 message={preview_text(str(exc))}")
         return error_response(f"provider transport error: {exc}", status_code=502)
+    except ProviderConfigurationError as exc:
+        record_activity("error", trace_id=trace_id, provider=route.provider)
+        write_failed_attempt_audit(trace_id, route, str(exc), 400)
+        trace_line(trace_id, f"provider_config_error status=400 message={preview_text(str(exc))}")
+        return error_response(str(exc), status_code=400)
+    except BudgetExceededError as exc:
+        record_activity("error", trace_id=trace_id, provider=route.provider)
+        write_failed_attempt_audit(trace_id, route, str(exc), 402)
+        return error_response(str(exc), status_code=402)
 
-    response = responses_object(payload, normalized, chat_response)
+    assert provider_result is not None
+    chat_response = provider_result.chat_response
+    try:
+        response = responses_object(payload, normalized, chat_response, provider_result=provider_result, route=route)
+    except ProviderIncompleteOutputError as exc:
+        retry_result = await retry_incomplete_subagent_response(
+            payload,
+            normalized,
+            route,
+            provider_result,
+            str(exc),
+        )
+        if retry_result is not None:
+            provider_result, normalized = retry_result
+            chat_response = provider_result.chat_response
+            try:
+                response = responses_object(payload, normalized, chat_response, provider_result=provider_result, route=route)
+            except ProviderIncompleteOutputError as retry_exc:
+                response = subagent_continuation_response(
+                    payload,
+                    normalized,
+                    provider_result,
+                    route,
+                    str(retry_exc),
+                )
+                if response is None:
+                    record_activity("error", trace_id=trace_id, provider=provider_result.provider)
+                    write_failed_attempt_audit(trace_id, route, str(retry_exc), 502)
+                    trace_line(trace_id, f"incomplete_provider_output status=502 message={preview_text(str(retry_exc))}")
+                    return error_response(str(retry_exc), status_code=502)
+        else:
+            record_activity("error", trace_id=trace_id, provider=provider_result.provider)
+            write_failed_attempt_audit(trace_id, route, str(exc), 502)
+            trace_line(trace_id, f"incomplete_provider_output status=502 message={preview_text(str(exc))}")
+            return error_response(str(exc), status_code=502)
+    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    estimated_cost = estimate_cost_usd(usage, SETTINGS.providers.get(provider_result.provider), provider_result.model)
+    if budget_hard_stop(estimated_cost, usage, provider_result.provider, provider_result.model):
+        record_activity("error", trace_id=trace_id, provider=provider_result.provider)
+        return error_response("budget exceeded for provider response", status_code=402)
+    # Post-response session check: include this response's cost/tokens
+    new_session_cost = round(float(ACTIVITY_STATE.get("total_cost_usd", 0.0)) + estimated_cost, 8)
+    new_session_tokens = int(ACTIVITY_STATE.get("total_tokens", 0)) + int(usage.get("total_tokens") or 0)
+    if budget_hard_stop_for_session(new_session_cost, new_session_tokens):
+        record_activity("error", trace_id=trace_id, provider=provider_result.provider)
+        return error_response("session budget exceeded", status_code=402)
+    if budget_hard_stop_for_day():
+        record_activity("error", trace_id=trace_id, provider=provider_result.provider)
+        return error_response("daily budget exceeded", status_code=402)
+    duration_ms = int((time.monotonic() - started) * 1000)
     record_activity(
         "response",
         trace_id=trace_id,
         model=normalized.requested_model,
+        provider=provider_result.provider,
+        provider_kind=provider_result.provider_kind,
+        latency_ms=provider_result.latency_ms or duration_ms,
+        cost_usd=estimated_cost,
+        total_tokens=int(usage.get("total_tokens") or 0),
         output_kind=response_output_kind(response),
         end_turn=response.get("end_turn"),
     )
     trace_response(trace_id, response)
+    chain = route.attempts or [
+        {
+            "provider": provider_result.provider,
+            "model": provider_result.model,
+            "status": "ok",
+            "latency_ms": provider_result.latency_ms,
+        }
+    ]
+    write_usage_record(
+        {
+            "timestamp": int(time.time()),
+            "trace_id": trace_id,
+            "provider": provider_result.provider,
+            "provider_kind": provider_result.provider_kind,
+            "model": provider_result.model,
+            "routing_policy": route.policy,
+            "selection_reason": route.reason,
+            "usage": usage,
+            "estimated_usage": provider_result.estimated_usage,
+            "estimated_cost_usd": estimated_cost,
+            "latency_ms": provider_result.latency_ms,
+            "fallback_chain": chain,
+        }
+    )
+    write_audit_record(
+        {
+            "timestamp": int(time.time()),
+            "trace_id": trace_id,
+            "status": "ok",
+            "provider": provider_result.provider,
+            "provider_kind": provider_result.provider_kind,
+            "model": provider_result.model,
+            "routing_policy": route.policy,
+            "selection_reason": route.reason,
+            "latency_ms": provider_result.latency_ms,
+            "total_tokens": usage.get("total_tokens", 0),
+            "usage": usage,
+            "estimated_cost_usd": estimated_cost,
+            "fallback_chain": chain,
+        }
+    )
     record_session_response(trace_id, normalized, response)
     if normalized.stream:
         return StreamingResponse(
@@ -157,6 +304,11 @@ def record_activity(
     kind: str,
     trace_id: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
+    provider_kind: str | None = None,
+    latency_ms: int | None = None,
+    cost_usd: float | None = None,
+    total_tokens: int | None = None,
     output_kind: str | None = None,
     end_turn: bool | None = None,
 ) -> None:
@@ -178,6 +330,30 @@ def record_activity(
         ACTIVITY_STATE["last_trace_id"] = trace_id
     if model is not None:
         ACTIVITY_STATE["last_model"] = model
+        by_model = ACTIVITY_STATE.setdefault("requests_by_model", {})
+        if kind == "response":
+            by_model[model] = int(by_model.get(model, 0)) + 1
+    if provider is not None:
+        ACTIVITY_STATE["last_provider"] = provider
+        if kind == "response":
+            by_provider = ACTIVITY_STATE.setdefault("requests_by_provider", {})
+            by_provider[provider] = int(by_provider.get(provider, 0)) + 1
+        if kind == "error":
+            errors = ACTIVITY_STATE.setdefault("errors_by_provider", {})
+            errors[provider] = int(errors.get(provider, 0)) + 1
+    if provider_kind == "local" and kind == "response":
+        ACTIVITY_STATE["local_request_count"] = int(ACTIVITY_STATE.get("local_request_count", 0)) + 1
+    if provider_kind == "cloud" and kind == "response":
+        ACTIVITY_STATE["cloud_request_count"] = int(ACTIVITY_STATE.get("cloud_request_count", 0)) + 1
+    if latency_ms is not None and kind == "response":
+        total_latency = int(ACTIVITY_STATE.get("total_latency_ms", 0)) + latency_ms
+        response_count = max(int(ACTIVITY_STATE.get("response_count", 0)), 1)
+        ACTIVITY_STATE["total_latency_ms"] = total_latency
+        ACTIVITY_STATE["average_latency_ms"] = int(total_latency / response_count)
+    if cost_usd is not None and kind == "response":
+        ACTIVITY_STATE["total_cost_usd"] = round(float(ACTIVITY_STATE.get("total_cost_usd", 0.0)) + cost_usd, 8)
+    if total_tokens is not None and kind == "response":
+        ACTIVITY_STATE["total_tokens"] = int(ACTIVITY_STATE.get("total_tokens", 0)) + total_tokens
     write_activity_state()
 
 
@@ -219,7 +395,7 @@ def session_mirror_snapshot() -> dict[str, Any]:
         (
             event
             for event in reversed(SESSION_EVENTS)
-            if event.get("end_turn") is True and event.get("messages")
+            if event.get("end_turn") is True
         ),
         None,
     )
@@ -300,6 +476,602 @@ def activity_snapshot() -> dict[str, Any]:
             seconds_since_last_activity is not None and seconds_since_last_activity <= 120
         ),
         "paths": SETTINGS.sanitized_paths(),
+    }
+
+
+class BudgetExceededError(ValueError):
+    pass
+
+
+class ProviderConfigurationError(ValueError):
+    pass
+
+
+class ProviderIncompleteOutputError(ValueError):
+    pass
+
+
+class RouteSelection:
+    def __init__(self, provider: str, model: str | None, fallback_providers: list[str], policy: str, reason: str) -> None:
+        self.provider = provider
+        self.model = model
+        self.fallback_providers = fallback_providers
+        self.policy = policy
+        self.reason = reason
+        self.attempts: list[dict[str, Any]] = []
+
+
+def select_route(request: Request, payload: dict[str, Any]) -> RouteSelection:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    manual_provider = (
+        request.query_params.get("provider")
+        or request.headers.get("x-subagent-provider")
+        or metadata.get("provider")
+    )
+    manual_model = request.query_params.get("model") or request.headers.get("x-subagent-model") or metadata.get("model")
+    policy_name = str(
+        request.query_params.get("routing_policy")
+        or request.headers.get("x-subagent-routing-policy")
+        or metadata.get("routing_policy")
+        or metadata.get("policy")
+        or ""
+    )
+    if manual_provider:
+        return RouteSelection(str(manual_provider), str(manual_model) if manual_model else None, SETTINGS.fallback_providers, policy_name or "manual", "manual override")
+    if policy_name:
+        policy = built_in_policy(policy_name) | SETTINGS.routing_policies.get(policy_name, {})
+        provider = str(policy.get("provider") or SETTINGS.provider)
+        fallback = policy.get("fallback_providers", SETTINGS.fallback_providers)
+        if isinstance(fallback, str):
+            fallback_providers = [fallback]
+        else:
+            fallback_providers = [str(item) for item in fallback]
+        model = str(policy["model"]) if policy.get("model") else None
+        provider, fallback_providers, reason = optimize_provider_order(
+            provider,
+            fallback_providers,
+            policy,
+            base_reason=f"routing policy {policy_name}",
+        )
+        return RouteSelection(provider, model, fallback_providers, policy_name, reason)
+    provider, fallback_providers, reason = optimize_provider_order(
+        SETTINGS.provider,
+        SETTINGS.fallback_providers,
+        {"automatic_routing": bool(SETTINGS.provider_predictions or SETTINGS.provider_health)},
+        base_reason="default provider",
+    )
+    return RouteSelection(provider, None, fallback_providers, "safe-default", reason)
+
+
+def built_in_policy(name: str) -> dict[str, Any]:
+    policies = {
+        "cheap-review": {"provider": configured_provider_or_default("deepseek")},
+        "local-only": {"provider": "ollama", "fallback_providers": []},
+        "high-context": {"provider": configured_provider_or_default("deepseek")},
+        "fast-draft": {
+            "provider": configured_provider_or_default("ollama"),
+            "fallback_providers": [configured_provider_or_default("deepseek")],
+        },
+        "safe-default": {"provider": SETTINGS.provider, "fallback_providers": SETTINGS.fallback_providers},
+        "budget-capped": {"provider": SETTINGS.provider, "fallback_providers": SETTINGS.fallback_providers},
+    }
+    return dict(policies.get(name, {}))
+
+
+def configured_provider_or_default(name: str) -> str:
+    config = SETTINGS.providers.get(name)
+    if config is not None and config.enabled:
+        return name
+    return SETTINGS.provider
+
+
+def optimize_provider_order(
+    provider: str,
+    fallback_providers: list[str],
+    policy: dict[str, Any],
+    *,
+    base_reason: str,
+) -> tuple[str, list[str], str]:
+    automatic = policy.get("automatic_routing", policy.get("optimize", False))
+    strategy = str(policy.get("strategy") or policy.get("selection_strategy") or "")
+    if not automatic and strategy not in {"automatic", "score", "scored"}:
+        return provider, fallback_providers, base_reason
+
+    candidates = unique_provider_order([provider, *fallback_providers])
+    scored = [(provider_score(name, policy), name) for name in candidates]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    ordered = [name for _, name in scored]
+    if not ordered:
+        return provider, fallback_providers, base_reason
+    selected = ordered[0]
+    reason = f"{base_reason}; automatic score selected {selected}"
+    return selected, ordered[1:], reason
+
+
+def unique_provider_order(providers: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for provider in providers:
+        if provider and provider not in seen:
+            seen.add(provider)
+            ordered.append(provider)
+    return ordered
+
+
+def provider_score(provider_name: str, policy: dict[str, Any]) -> float:
+    config = SETTINGS.providers.get(provider_name)
+    if config is None or not config.enabled:
+        return -1_000_000.0
+
+    prediction = SETTINGS.provider_predictions.get(provider_name)
+    health = SETTINGS.provider_health.get(provider_name)
+    reliability = (
+        prediction.reliability_score
+        if prediction and prediction.reliability_score is not None
+        else (health.uptime_fraction if health else 1.0)
+    )
+    capability = (
+        prediction.capability_score
+        if prediction and prediction.capability_score is not None
+        else capability_score(config)
+    )
+    latency_ms = (
+        prediction.latency_p50_ms
+        if prediction and prediction.latency_p50_ms is not None
+        else (health.average_latency_ms if health and health.average_latency_ms else config.capabilities.timeout_seconds)
+    )
+    cost_usd = prediction.budget_prediction_usd if prediction else None
+    if cost_usd is None:
+        cost_usd = 0.0 if config.kind == "local" else 0.01
+
+    score = (float(reliability or 0.0) * 100.0) + (float(capability or 0.0) * 30.0)
+    if latency_ms:
+        score -= min(float(latency_ms), 120_000.0) / 1000.0
+    score -= float(cost_usd or 0.0) * 100.0
+
+    timeout_budget_ms = _policy_float(policy, "timeout_budget_ms")
+    if timeout_budget_ms is not None and latency_ms and float(latency_ms) > timeout_budget_ms:
+        score -= 100.0
+    cost_target = _policy_float(policy, "cost_target_usd")
+    if cost_target is not None and cost_usd is not None and float(cost_usd) > cost_target:
+        score -= 100.0
+    if health and health.consecutive_errors:
+        score -= min(health.consecutive_errors, 10) * 20.0
+    return score
+
+
+def capability_score(config: ProviderConfig) -> float:
+    score = 0.0
+    if config.capabilities.supports_tools:
+        score += 0.35
+    if config.capabilities.supports_streaming:
+        score += 0.15
+    if config.capabilities.supports_reasoning:
+        score += 0.25
+    if config.capabilities.context_window and config.capabilities.context_window >= 100_000:
+        score += 0.25
+    return score
+
+
+def _policy_float(policy: dict[str, Any], key: str) -> float | None:
+    value = policy.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def call_provider(normalized: NormalizedRequest, route: RouteSelection) -> ProviderResponse:
+    candidates = [route.provider, *route.fallback_providers]
+    last_error: httpx.HTTPError | None = None
+    for index, provider_name in enumerate(candidates):
+        config = SETTINGS.providers.get(provider_name)
+        if config is None or not config.enabled:
+            route.attempts.append({"provider": provider_name, "status": "skipped", "error": "not configured or disabled"})
+            last_error = httpx.HTTPError(f"provider {provider_name!r} is not configured or enabled")
+            continue
+        if SETTINGS.allowed_providers and provider_name not in SETTINGS.allowed_providers:
+            route.attempts.append({"provider": provider_name, "status": "blocked", "error": "not in allowlist"})
+            raise ProviderConfigurationError(f"provider {provider_name!r} is not in the configured allowlist")
+        if provider_name in SETTINGS.denied_providers:
+            route.attempts.append({"provider": provider_name, "status": "blocked", "error": "denylisted"})
+            raise ProviderConfigurationError(f"provider {provider_name!r} is denied by configuration")
+        selected_model = route.model or config.model or normalized.model
+        try:
+            provider = build_provider(config)
+            if budget_hard_stop_for_request(normalized, config, selected_model):
+                route.attempts.append({"provider": provider_name, "model": selected_model, "status": "budget_exceeded"})
+                raise BudgetExceededError("budget exceeded before provider request")
+            if index > 0:
+                ACTIVITY_STATE["fallback_count"] = int(ACTIVITY_STATE.get("fallback_count", 0)) + 1
+            result = await provider.chat(normalized, model=route.model)
+            route.attempts.append({
+                "provider": result.provider, "model": result.model, "status": "ok",
+                "latency_ms": result.latency_ms,
+                "error_category": None,
+            })
+            update_provider_health(result.provider, success=True, latency_ms=result.latency_ms)
+            return result
+        except BudgetExceededError:
+            raise
+        except ProviderConfigurationError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            exc.response.extensions["subagent_router_provider"] = provider_name
+            exc.response.extensions["subagent_router_model"] = selected_model
+            cat = error_category(status_code=exc.response.status_code)
+            route.attempts.append({
+                "provider": provider_name, "model": selected_model, "status": "error",
+                "status_code": exc.response.status_code,
+                "error_category": cat,
+            })
+            update_provider_health(provider_name, success=False)
+            if exc.response.status_code < 500 or index == len(candidates) - 1:
+                raise
+            last_error = exc
+        except httpx.HTTPError as exc:
+            cat = error_category(error_message=str(exc))
+            route.attempts.append({
+                "provider": provider_name, "model": selected_model, "status": "error",
+                "error": preview_text(str(exc), 160),
+                "error_category": cat,
+            })
+            update_provider_health(provider_name, success=False)
+            if index == len(candidates) - 1:
+                raise
+            last_error = exc
+    raise last_error or httpx.HTTPError("no provider candidates were available")
+
+
+def build_provider(config: ProviderConfig) -> Provider:
+    if config.provider_type == "deepseek":
+        if SETTINGS.mock_deepseek:
+            return MockDeepSeekProvider(config)
+        if not config.api_key:
+            raise ProviderConfigurationError("DEEPSEEK_API_KEY is required")
+        return DeepSeekProvider(config)
+    if config.provider_type == "ollama":
+        return OllamaProvider(config)
+    return OpenAICompatibleProvider(config)
+
+
+def dry_run_provider_response(normalized: NormalizedRequest, route: RouteSelection) -> ProviderResponse:
+    provider = route.provider
+    config = SETTINGS.providers.get(provider)
+    model = route.model or (config.model if config else None) or normalized.model
+    return ProviderResponse(
+        provider=provider,
+        model=model,
+        provider_kind=(config.kind if config else "unknown"),
+        chat_response={
+            "choices": [{"message": {"role": "assistant", "content": "Subagent Router dry run: provider request skipped"}}],
+            "usage": {
+                "prompt_tokens": estimate_message_tokens(normalized.messages),
+                "completion_tokens": 0,
+                "total_tokens": estimate_message_tokens(normalized.messages),
+            },
+        },
+        latency_ms=0,
+        estimated_usage=True,
+    )
+
+
+def estimate_cost_usd(usage: dict[str, Any], config: ProviderConfig | None, model: str) -> float:
+    if config is None or config.kind == "local":
+        return 0.0
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    input_rate = config.capabilities.input_cost_per_million
+    output_rate = config.capabilities.output_cost_per_million
+    if input_rate is None and output_rate is None:
+        input_rate, output_rate = default_price_per_million(config.name, model)
+    return round(((input_tokens * (input_rate or 0.0)) + (output_tokens * (output_rate or 0.0))) / 1_000_000, 8)
+
+
+def default_price_per_million(provider: str, model: str) -> tuple[float | None, float | None]:
+    if provider == "deepseek":
+        if "pro" in model or "reasoner" in model:
+            return 0.55, 2.19
+        return 0.27, 1.10
+    return None, None
+
+
+def budget_hard_stop_for_request(normalized: NormalizedRequest, config: ProviderConfig, model: str) -> bool:
+    token_limit = lowest_configured_limit(
+        SETTINGS.max_tokens_per_task,
+        SETTINGS.max_tokens_per_provider.get(config.name),
+        SETTINGS.max_tokens_per_model.get(model),
+    )
+    cost_limit = lowest_configured_limit(
+        SETTINGS.max_cost_per_task,
+        SETTINGS.max_spend_per_task,
+        SETTINGS.max_cost_per_provider.get(config.name),
+        SETTINGS.max_spend_per_provider.get(config.name),
+        SETTINGS.max_cost_per_model.get(model),
+        SETTINGS.max_spend_per_model.get(model),
+    )
+    prediction = SETTINGS.provider_predictions.get(config.name)
+    estimated_prompt_tokens = estimate_message_tokens(normalized.messages)
+    predicted_tokens = prediction.budget_prediction_tokens if prediction else None
+    predicted_cost = prediction.budget_prediction_usd if prediction else None
+    token_limit_hit = token_limit is not None and max(estimated_prompt_tokens, int(predicted_tokens or 0)) > token_limit
+    cost_limit_hit = cost_limit is not None and predicted_cost is not None and predicted_cost > cost_limit
+    if not (token_limit_hit or cost_limit_hit):
+        return False
+    if SETTINGS.budget_mode == "hard-stop":
+        return True
+    write_audit_record(
+        {
+            "timestamp": int(time.time()),
+            "status": "budget-warning",
+            "provider": config.name,
+            "model": model,
+            "estimated_prompt_tokens": estimated_prompt_tokens,
+            "predicted_cost_usd": predicted_cost,
+            "predicted_tokens": predicted_tokens,
+            "max_cost": cost_limit,
+            "max_tokens": token_limit,
+            "max_tokens_per_task": SETTINGS.max_tokens_per_task,
+            "max_tokens_per_provider": SETTINGS.max_tokens_per_provider.get(config.name),
+            "max_tokens_per_model": SETTINGS.max_tokens_per_model.get(model),
+        }
+    )
+    return False
+
+
+def budget_hard_stop(cost_usd: float, usage: dict[str, Any], provider: str, model: str) -> bool:
+    token_limit = lowest_configured_limit(
+        SETTINGS.max_tokens_per_task,
+        SETTINGS.max_tokens_per_provider.get(provider),
+        SETTINGS.max_tokens_per_model.get(model),
+    )
+    cost_limit = lowest_configured_limit(
+        SETTINGS.max_cost_per_task,
+        SETTINGS.max_spend_per_task,
+        SETTINGS.max_cost_per_provider.get(provider),
+        SETTINGS.max_spend_per_provider.get(provider),
+        SETTINGS.max_cost_per_model.get(model),
+        SETTINGS.max_spend_per_model.get(model),
+    )
+    token_limit_hit = token_limit is not None and int(usage.get("total_tokens") or 0) > token_limit
+    cost_limit_hit = cost_limit is not None and cost_usd > cost_limit
+    if not (token_limit_hit or cost_limit_hit):
+        return False
+    record = {
+        "timestamp": int(time.time()),
+        "status": "budget-warning",
+        "provider": provider,
+        "model": model,
+        "cost_usd": cost_usd,
+        "max_cost": cost_limit,
+        "max_cost_per_task": SETTINGS.max_cost_per_task,
+        "max_cost_per_provider": SETTINGS.max_cost_per_provider.get(provider),
+        "max_cost_per_model": SETTINGS.max_cost_per_model.get(model),
+        "total_tokens": usage.get("total_tokens", 0),
+        "max_tokens": token_limit,
+        "max_tokens_per_task": SETTINGS.max_tokens_per_task,
+        "max_tokens_per_provider": SETTINGS.max_tokens_per_provider.get(provider),
+        "max_tokens_per_model": SETTINGS.max_tokens_per_model.get(model),
+    }
+    write_audit_record(record)
+    return SETTINGS.budget_mode == "hard-stop"
+
+
+def budget_hard_stop_for_session(cost_usd: float, total_tokens: int) -> bool:
+    """Check session-level budget limits against in-memory activity state."""
+    cost_limit = lowest_configured_limit(SETTINGS.max_cost_per_session, SETTINGS.max_spend_per_session)
+    token_limit = SETTINGS.max_tokens_per_session
+    cost_limit_hit = cost_limit is not None and cost_usd > cost_limit
+    token_limit_hit = token_limit is not None and total_tokens > token_limit
+    if not (token_limit_hit or cost_limit_hit):
+        return False
+    record = {
+        "timestamp": int(time.time()),
+        "status": "budget-warning",
+        "budget_level": "session",
+        "type": "cost" if cost_limit_hit else "tokens",
+        "session_cost_usd": cost_usd,
+        "max_cost_per_session": cost_limit,
+        "session_total_tokens": total_tokens,
+        "max_tokens_per_session": token_limit,
+    }
+    write_audit_record(record)
+    return SETTINGS.budget_mode == "hard-stop"
+
+
+def budget_hard_stop_for_day() -> bool:
+    """Check daily budget limits against persisted usage summary."""
+    cost_limit = lowest_configured_limit(SETTINGS.max_cost_per_day, SETTINGS.max_spend_per_day)
+    token_limit = SETTINGS.max_tokens_per_day
+    if cost_limit is None and token_limit is None:
+        return False
+    today = datetime.date.today().isoformat()
+    summary = read_usage_summary()
+    daily = summary.get("daily_usage", {}).get(today, {})
+    daily_cost = float(daily.get("total_cost_usd", 0.0))
+    daily_tokens = int(daily.get("total_tokens", 0))
+    cost_limit_hit = cost_limit is not None and daily_cost > cost_limit
+    token_limit_hit = token_limit is not None and daily_tokens > token_limit
+    if not (token_limit_hit or cost_limit_hit):
+        return False
+    record = {
+        "timestamp": int(time.time()),
+        "status": "budget-warning",
+        "budget_level": "daily",
+        "type": "cost" if cost_limit_hit else "tokens",
+        "daily_cost_usd": daily_cost,
+        "max_cost_per_day": cost_limit,
+        "daily_total_tokens": daily_tokens,
+        "max_tokens_per_day": token_limit,
+    }
+    write_audit_record(record)
+    return SETTINGS.budget_mode == "hard-stop"
+
+
+def error_category(status_code: int | None = None, error_message: str | None = None) -> str:
+    """Classify an error into a category for diagnostics."""
+    if status_code is not None:
+        if status_code in (401, 403):
+            return "auth"
+        if status_code == 429:
+            return "rate_limit"
+        if status_code in (408, 504):
+            return "timeout"
+        if status_code >= 500:
+            return "server_error"
+        if 400 <= status_code < 500:
+            return "client_error"
+    if error_message:
+        lower = error_message.lower()
+        if "timeout" in lower or "timed out" in lower:
+            return "timeout"
+        if "rate" in lower or "limit" in lower or "quota" in lower or "capacity" in lower:
+            return "rate_limit"
+        if "auth" in lower or "key" in lower or "credential" in lower or "unauthorized" in lower or "forbidden" in lower:
+            return "auth"
+        if "unavailable" in lower or "down" in lower or "503" in lower:
+            return "server_error"
+    return "unknown"
+
+
+def update_provider_health(provider_name: str, success: bool, latency_ms: int = 0) -> None:
+    """Update in-memory provider health metadata after a request attempt."""
+    health = SETTINGS.provider_health.get(provider_name)
+    total_req = (health.total_requests if health else 0) + 1
+    total_err = (health.total_errors if health else 0) + (0 if success else 1)
+    consec = 0 if success else (health.consecutive_errors if health else 0) + 1
+    avg_lat = health.average_latency_ms if health else 0.0
+    if success:
+        avg_lat = (avg_lat * (total_req - 2) + latency_ms) / max(total_req - 1, 1) if total_req > 1 else float(latency_ms)
+    error_rate = total_err / max(total_req, 1)
+    SETTINGS.provider_health[provider_name] = ProviderHealthMetadata(
+        last_error_at=time.time() if not success else (health.last_error_at if health else None),
+        last_success_at=time.time() if success else (health.last_success_at if health else None),
+        consecutive_errors=consec,
+        total_requests=total_req,
+        total_errors=total_err,
+        error_rate=error_rate,
+        average_latency_ms=avg_lat,
+        uptime_fraction=1.0 - error_rate,
+    )
+
+
+def lowest_configured_limit(*limits: float | int | None) -> float | int | None:
+    configured = [limit for limit in limits if limit is not None]
+    if not configured:
+        return None
+    return min(configured)
+
+
+def estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
+    chars = sum(len(str(message.get("content") or "")) for message in messages)
+    return max(1, int(chars / 4))
+
+
+def write_audit_record(record: dict[str, Any]) -> None:
+    try:
+        SETTINGS.audit_log_file.parent.mkdir(parents=True, exist_ok=True)
+        with SETTINGS.audit_log_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sanitize_diagnostic(record), sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def write_failed_attempt_audit(trace_id: str, route: RouteSelection, message: str, status_code: int) -> None:
+    """Write an audit record with enriched fallback chain diagnostics."""
+    chain_diagnostics = []
+    for attempt in route.attempts:
+        diag = dict(attempt)
+        diag["error_category"] = error_category(
+            status_code=attempt.get("status_code"),
+            error_message=attempt.get("error"),
+        )
+        provider_name = attempt.get("provider", "")
+        if provider_name:
+            health = SETTINGS.provider_health.get(provider_name)
+            if health:
+                diag["provider_health"] = {
+                    "consecutive_errors": health.consecutive_errors,
+                    "error_rate": health.error_rate,
+                    "average_latency_ms": health.average_latency_ms,
+                }
+        chain_diagnostics.append(diag)
+    write_audit_record(
+        {
+            "timestamp": int(time.time()),
+            "trace_id": trace_id,
+            "status": "error",
+            "provider": route.provider,
+            "routing_policy": route.policy,
+            "selection_reason": route.reason,
+            "status_code": status_code,
+            "message": message,
+            "fallback_chain": chain_diagnostics,
+            "provider_health_snapshot": {
+                name: {
+                    "consecutive_errors": h.consecutive_errors,
+                    "error_rate": h.error_rate,
+                    "average_latency_ms": h.average_latency_ms,
+                }
+                for name, h in SETTINGS.provider_health.items()
+            },
+        }
+    )
+
+
+def write_usage_record(record: dict[str, Any]) -> None:
+    with USAGE_LOCK:
+        try:
+            SETTINGS.usage_file.parent.mkdir(parents=True, exist_ok=True)
+            current = read_usage_summary()
+            records = current.setdefault("records", [])
+            if isinstance(records, list):
+                records.append(record)
+                del records[:-200]
+            current["request_count"] = int(current.get("request_count", 0)) + 1
+            current["total_tokens"] = int(current.get("total_tokens", 0)) + int(record.get("usage", {}).get("total_tokens") or 0)
+            current["total_cost_usd"] = round(float(current.get("total_cost_usd", 0.0)) + float(record.get("estimated_cost_usd") or 0.0), 8)
+            by_provider = current.setdefault("requests_by_provider", {})
+            provider = str(record.get("provider") or "unknown")
+            by_provider[provider] = int(by_provider.get(provider, 0)) + 1
+            by_model = current.setdefault("requests_by_model", {})
+            model = str(record.get("model") or "unknown")
+            by_model[model] = int(by_model.get(model, 0)) + 1
+            # Track daily totals
+            today = datetime.date.today().isoformat()
+            daily_usage = current.setdefault("daily_usage", {})
+            day = daily_usage.setdefault(today, {"total_cost_usd": 0.0, "total_tokens": 0, "request_count": 0})
+            day["total_cost_usd"] = round(float(day.get("total_cost_usd", 0.0)) + float(record.get("estimated_cost_usd") or 0.0), 8)
+            day["total_tokens"] = int(day.get("total_tokens", 0)) + int(record.get("usage", {}).get("total_tokens") or 0)
+            day["request_count"] = int(day.get("request_count", 0)) + 1
+            tmp_path = SETTINGS.usage_file.with_suffix(SETTINGS.usage_file.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
+            tmp_path.replace(SETTINGS.usage_file)
+            SETTINGS.usage_jsonl_file.parent.mkdir(parents=True, exist_ok=True)
+            with SETTINGS.usage_jsonl_file.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(sanitize_diagnostic(record), sort_keys=True) + "\n")
+        except OSError:
+            pass
+
+
+def read_usage_summary() -> dict[str, Any]:
+    try:
+        if SETTINGS.usage_file.exists():
+            data = json.loads(SETTINGS.usage_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {
+        "request_count": 0,
+        "total_tokens": 0,
+        "total_cost_usd": 0.0,
+        "requests_by_provider": {},
+        "requests_by_model": {},
+        "daily_usage": {},
+        "records": [],
     }
 
 
@@ -404,8 +1176,145 @@ def recent_tool_outputs(messages: list[dict[str, Any]], limit: int = 3) -> list[
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "default_provider": SETTINGS.provider,
+        "config_warnings": SETTINGS.config_warnings,
+        "debug_mode": SETTINGS.debug_mode,
+        "providers": {
+            name: {
+                "type": config.provider_type,
+                "kind": config.kind,
+                "enabled": config.enabled,
+                "base_url": config.base_url,
+                "model": config.model,
+            }
+            for name, config in SETTINGS.providers.items()
+        },
+        "provider_health": {
+            name: {
+                "consecutive_errors": h.consecutive_errors,
+                "error_rate": h.error_rate,
+                "average_latency_ms": h.average_latency_ms,
+                "uptime_fraction": h.uptime_fraction,
+            }
+            for name, h in SETTINGS.provider_health.items()
+        },
+    }
+
+
+@app.get("/v1/config")
+async def get_config() -> dict[str, Any]:
+    # Build per-provider pricing info
+    provider_pricing = {}
+    for name, cfg in SETTINGS.providers.items():
+        if not cfg.enabled:
+            continue
+        inp = cfg.capabilities.input_cost_per_million
+        out = cfg.capabilities.output_cost_per_million
+        if inp is None and out is None:
+            inp, out = default_price_per_million(name, cfg.model or "")
+        provider_pricing[name] = {
+            "input_cost_per_million": inp,
+            "output_cost_per_million": out,
+            "cost_hint": cfg.capabilities.cost_hint,
+            "model": cfg.model,
+        }
+    return {
+        "provider": SETTINGS.provider,
+        "fallback_providers": SETTINGS.fallback_providers,
+        "budget_mode": SETTINGS.budget_mode,
+        "max_cost_per_day": SETTINGS.max_cost_per_day,
+        "max_cost_per_session": SETTINGS.max_cost_per_session,
+        "max_cost_per_task": SETTINGS.max_cost_per_task,
+        "max_tokens_per_day": SETTINGS.max_tokens_per_day,
+        "max_tokens_per_session": SETTINGS.max_tokens_per_session,
+        "max_tokens_per_task": SETTINGS.max_tokens_per_task,
+        "max_cost_per_provider": SETTINGS.max_cost_per_provider,
+        "max_tokens_per_provider": SETTINGS.max_tokens_per_provider,
+        "provider_pricing": provider_pricing,
+        "providers": {name: {"model": p.model, "enabled": p.enabled} for name, p in SETTINGS.providers.items()},
+        "routing_policies": SETTINGS.routing_policies,
+    }
+
+
+@app.patch("/v1/config")
+async def patch_config(request: Request) -> JSONResponse:
+    global SETTINGS
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    updates = {}
+    if "provider" in data:
+        updates["provider"] = str(data["provider"])
+    if "budget_mode" in data:
+        updates["budget_mode"] = str(data["budget_mode"])
+    if "max_cost_per_day" in data:
+        updates["max_cost_per_day"] = float(data["max_cost_per_day"]) if data["max_cost_per_day"] is not None else None
+    if "max_tokens_per_day" in data:
+        updates["max_tokens_per_day"] = int(data["max_tokens_per_day"]) if data["max_tokens_per_day"] is not None else None
+    if "max_cost_per_session" in data:
+        updates["max_cost_per_session"] = float(data["max_cost_per_session"]) if data["max_cost_per_session"] is not None else None
+    if "max_tokens_per_session" in data:
+        updates["max_tokens_per_session"] = int(data["max_tokens_per_session"]) if data["max_tokens_per_session"] is not None else None
+    if "max_cost_per_task" in data:
+        updates["max_cost_per_task"] = float(data["max_cost_per_task"]) if data["max_cost_per_task"] is not None else None
+    if "max_tokens_per_task" in data:
+        updates["max_tokens_per_task"] = int(data["max_tokens_per_task"]) if data["max_tokens_per_task"] is not None else None
+    if "max_cost_per_provider" in data:
+        updates["max_cost_per_provider"] = {str(k): float(v) for k, v in data["max_cost_per_provider"].items()}
+    if "max_tokens_per_provider" in data:
+        updates["max_tokens_per_provider"] = {str(k): int(v) for k, v in data["max_tokens_per_provider"].items()}
+    if "provider_models" in data:
+        new_providers = dict(SETTINGS.providers)
+        for pname, model in data["provider_models"].items():
+            if pname in new_providers:
+                new_providers[pname] = replace(new_providers[pname], model=str(model))
+        updates["providers"] = new_providers
+
+    if "routing_policies" in data:
+        new_policies = dict(SETTINGS.routing_policies)
+        for name, updates in data["routing_policies"].items():
+            existing = new_policies.get(name, {})
+            new_policies[name] = {**existing, **updates}
+        updates["routing_policies"] = new_policies
+
+    if updates:
+        SETTINGS = replace(SETTINGS, **updates).ensure_active_providers_enabled()
+        SETTINGS.save_runtime_config()
+
+        # Prepare serializable updates for response
+        serializable_updates = dict(updates)
+        if "providers" in serializable_updates:
+            serializable_updates["providers"] = {
+                name: {"model": p.model, "enabled": p.enabled}
+                for name, p in serializable_updates["providers"].items()
+            }
+
+        return JSONResponse({"status": "updated", "config": serializable_updates})
+
+    return JSONResponse({"status": "no changes"})
+
+
+@app.get("/v1/check-provider/{name}")
+async def check_provider(name: str) -> dict[str, Any]:
+    config = SETTINGS.providers.get(name)
+    if config is None:
+        return {"available": False, "error": f"Provider {name!r} not found"}
+
+    try:
+        provider = build_provider(config)
+        # Check if the provider instance has a check_availability method
+        if hasattr(provider, "check_availability"):
+            result = await provider.check_availability()
+            return result
+        else:
+            return {"available": True, "note": "Live check not implemented for this provider type"}
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
 
 
 @app.get("/debug/activity")
@@ -418,37 +1327,157 @@ async def debug_paths() -> dict[str, str]:
     return SETTINGS.sanitized_paths()
 
 
-async def call_deepseek(normalized: NormalizedRequest) -> dict[str, Any]:
-    if SETTINGS.mock_deepseek:
-        return mock_deepseek_response(normalized)
-
-    if not SETTINGS.deepseek_api_key:
-        raise httpx.HTTPError("DEEPSEEK_API_KEY is required")
-
-    body: dict[str, Any] = {
-        "model": SETTINGS.deepseek_model or normalized.model,
-        "messages": normalized.messages,
+@app.get("/debug/config")
+async def debug_config() -> dict[str, Any]:
+    return {
+        "config_warnings": SETTINGS.config_warnings,
+        "budget_mode": SETTINGS.budget_mode,
+        "provider": SETTINGS.provider,
+        "fallback_providers": SETTINGS.fallback_providers,
+        "allowed_providers": SETTINGS.allowed_providers,
+        "denied_providers": SETTINGS.denied_providers,
+        "dry_run": SETTINGS.dry_run,
+        "debug_mode": SETTINGS.debug_mode,
+        "provider_predictions": {
+            name: {
+                "reliability_score": p.reliability_score,
+                "latency_p50_ms": p.latency_p50_ms,
+                "latency_p99_ms": p.latency_p99_ms,
+                "capability_score": p.capability_score,
+                "budget_prediction_usd": p.budget_prediction_usd,
+                "budget_prediction_tokens": p.budget_prediction_tokens,
+            }
+            for name, p in SETTINGS.provider_predictions.items()
+        },
+        "provider_health": {
+            name: {
+                "consecutive_errors": h.consecutive_errors,
+                "error_rate": h.error_rate,
+                "average_latency_ms": h.average_latency_ms,
+                "uptime_fraction": h.uptime_fraction,
+            }
+            for name, h in SETTINGS.provider_health.items()
+        },
     }
-    if normalized.tools:
-        body["tools"] = normalized.tools
-        body["tool_choice"] = "auto"
-    if SETTINGS.send_parallel_tool_calls:
-        body["parallel_tool_calls"] = normalized.parallel_tool_calls
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        response = await client.post(
-            f"{SETTINGS.deepseek_base_url.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {SETTINGS.deepseek_api_key}"},
-            json=body,
-        )
-        response.raise_for_status()
-        return response.json()
+
+async def call_deepseek(normalized: NormalizedRequest) -> dict[str, Any]:
+    route = RouteSelection("deepseek", None, [], "legacy", "legacy call_deepseek")
+    return (await call_provider(normalized, route)).chat_response
+
+
+async def retry_incomplete_subagent_response(
+    original_payload: dict[str, Any],
+    normalized: NormalizedRequest,
+    route: RouteSelection,
+    first_result: ProviderResponse,
+    reason: str,
+) -> tuple[ProviderResponse, NormalizedRequest] | None:
+    if not is_subagent_model(normalized.requested_model) and not is_subagent_model(normalized.model):
+        return None
+    metadata = original_payload.get("metadata") if isinstance(original_payload.get("metadata"), dict) else {}
+    if metadata.get("disable_incomplete_retry") is True:
+        return None
+
+    retry_messages = [
+        *normalized.messages,
+        {
+            "role": "user",
+            "content": (
+                "Continue from the previous tool result. Do not describe a future action. "
+                "If work is complete, finish now with changed files and tests run. "
+                "If work remains, call the needed tool now."
+            ),
+        },
+    ]
+    retry_normalized = replace(normalized, messages=retry_messages)
+    write_audit_record(
+        {
+            "timestamp": int(time.time()),
+            "status": "incomplete-output-retry",
+            "provider": first_result.provider,
+            "model": first_result.model,
+            "routing_policy": route.policy,
+            "selection_reason": route.reason,
+            "reason": reason,
+        }
+    )
+    return await call_provider(retry_normalized, route), retry_normalized
+
+
+def subagent_continuation_response(
+    original_payload: dict[str, Any],
+    normalized: NormalizedRequest,
+    provider_result: ProviderResponse,
+    route: RouteSelection,
+    reason: str,
+) -> dict[str, Any] | None:
+    if not is_subagent_model(normalized.requested_model) and not is_subagent_model(normalized.model):
+        return None
+    mapping = normalized.tool_name_map.get("exec_command")
+    if mapping is None:
+        return None
+
+    response_id = f"resp_{uuid.uuid4().hex}"
+    call_id = f"call_{uuid.uuid4().hex[:24]}"
+    arguments = json.dumps({"cmd": "true"}, ensure_ascii=True, separators=(",", ":"))
+    chat_tool_call = {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": "exec_command", "arguments": arguments},
+    }
+    assistant_message = {"role": "assistant", "content": None, "tool_calls": [chat_tool_call]}
+    RESPONSE_STATES[response_id] = normalized.messages + [assistant_message]
+    _evict_old_response_states()
+
+    item = {
+        "type": "function_call",
+        "id": f"fc_0_{call_id}",
+        "name": mapping.name,
+        "arguments": arguments,
+        "call_id": call_id,
+    }
+    if mapping.namespace:
+        item["namespace"] = mapping.namespace
+    write_audit_record(
+        {
+            "timestamp": int(time.time()),
+            "status": "synthetic-continuation",
+            "provider": provider_result.provider,
+            "model": provider_result.model,
+            "routing_policy": route.policy,
+            "selection_reason": route.reason,
+            "reason": reason,
+            "tool": "exec_command",
+        }
+    )
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": original_payload.get("model") or normalized.requested_model,
+        "output": [item],
+        "usage": normalize_usage(None),
+        "end_turn": False,
+        "metadata": {
+            "proxy": "subagent-router",
+            "dropped_tools": normalized.dropped_tools,
+            "provider": provider_result.provider,
+            "provider_kind": provider_result.provider_kind,
+            "provider_model": provider_result.model,
+            "routing_policy": route.policy,
+            "provider_selection_reason": route.reason,
+            "synthetic_continuation": True,
+        },
+    }
 
 
 def responses_object(
     original_payload: dict[str, Any],
     normalized: NormalizedRequest,
     chat_response: dict[str, Any],
+    provider_result: ProviderResponse | None = None,
+    route: RouteSelection | None = None,
 ) -> dict[str, Any]:
     response_id = f"resp_{uuid.uuid4().hex}"
     output_items, assistant_messages, reasoning_by_call_id = response_items_from_chat(
@@ -456,6 +1485,29 @@ def responses_object(
         normalized.tool_name_map,
     )
     has_tool_calls = any(item["type"] in {"function_call", "custom_tool_call"} for item in output_items)
+    message_texts = [
+        message_text(item)
+        for item in output_items
+        if isinstance(item, dict) and item.get("type") == "message"
+    ]
+    nonempty_message_texts = [text for text in message_texts if text]
+
+    if not output_items:
+        raise ProviderIncompleteOutputError("provider returned empty output: no assistant message or tool call")
+    if not has_tool_calls and not nonempty_message_texts:
+        raise ProviderIncompleteOutputError("provider returned an empty final assistant message")
+    if (
+        not has_tool_calls
+        and (is_subagent_model(normalized.requested_model) or is_subagent_model(normalized.model))
+        and nonempty_message_texts
+        and all(is_progress_only_final_text(text) for text in nonempty_message_texts)
+    ):
+        raise ProviderIncompleteOutputError("provider returned progress text instead of a final subagent result")
+    if (
+        not has_tool_calls
+        and subagent_final_lacks_write_evidence(normalized, nonempty_message_texts)
+    ):
+        raise ProviderIncompleteOutputError("provider returned a final subagent result before performing the requested write")
 
     RESPONSE_STATES[response_id] = normalized.messages + assistant_messages
     REASONING_CONTENT_BY_CALL_ID.update(reasoning_by_call_id)
@@ -473,6 +1525,11 @@ def responses_object(
         "metadata": {
             "proxy": "subagent-router",
             "dropped_tools": normalized.dropped_tools,
+            "provider": provider_result.provider if provider_result else "deepseek",
+            "provider_kind": provider_result.provider_kind if provider_result else "cloud",
+            "provider_model": provider_result.model if provider_result else normalized.model,
+            "routing_policy": route.policy if route else "legacy",
+            "provider_selection_reason": route.reason if route else "legacy",
         },
     }
 
@@ -573,6 +1630,127 @@ def response_items_from_chat(
     return output, assistant_messages, reasoning_by_call_id
 
 
+def is_subagent_model(model: str) -> bool:
+    return model in {
+        "deepseek-worker",
+        "deepseek-reviewer",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-lite",
+        "deepseek-prod",
+    } or model.startswith("subagent-")
+
+
+def subagent_final_lacks_write_evidence(
+    normalized: NormalizedRequest,
+    final_texts: list[str],
+) -> bool:
+    if not is_subagent_model(normalized.requested_model) and not is_subagent_model(normalized.model):
+        return False
+    if "apply_patch" not in normalized.normalized_tool_names:
+        return False
+    if has_tool_call(normalized.messages, "apply_patch"):
+        return False
+    if not request_has_write_intent(normalized.messages):
+        return False
+    final_text = " ".join(final_texts)
+    if final_has_no_change_rationale(final_text):
+        return False
+    return True
+
+
+def has_tool_call(messages: list[dict[str, Any]], tool_name: str) -> bool:
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if function.get("name") == tool_name:
+                return True
+    return False
+
+
+def request_has_write_intent(messages: list[dict[str, Any]]) -> bool:
+    user_text = " ".join(
+        str(message.get("content") or "")
+        for message in messages
+        if message.get("role") == "user"
+    ).lower()
+    write_terms = (
+        " make ",
+        " change ",
+        " update ",
+        " edit ",
+        " add ",
+        " remove ",
+        " delete ",
+        " replace ",
+        " patch ",
+        " fix ",
+        " implement ",
+        " modify ",
+        " rewrite ",
+        " refactor ",
+        " create ",
+    )
+    padded = f" {user_text} "
+    return any(term in padded for term in write_terms)
+
+
+def final_has_no_change_rationale(text: str) -> bool:
+    lower = " ".join(text.strip().split()).lower()
+    no_change_terms = (
+        "no changes needed",
+        "no change needed",
+        "no changes were needed",
+        "no changes required",
+        "no edit needed",
+        "already present",
+        "already up to date",
+        "already matches",
+        "nothing to change",
+    )
+    return any(term in lower for term in no_change_terms)
+
+
+def is_progress_only_final_text(text: str) -> bool:
+    normalized = " ".join(text.strip().split())
+    if not normalized or len(normalized) > 360:
+        return False
+    lower = normalized.rstrip(".:;!").lower()
+    completion_terms = (
+        "changed",
+        "updated",
+        "fixed",
+        "implemented",
+        "added",
+        "wrote",
+        "created",
+        "removed",
+        "renamed",
+        "ran ",
+        "tested",
+        "verified",
+        "completed",
+        "finished",
+        "done",
+        "no changes",
+    )
+    if any(term in lower for term in completion_terms):
+        return False
+    action = r"(fix|apply|implement|inspect|check|update|run|read|look|make|change|add|write|create|review|test|patch|edit|adjust|modify|replace)"
+    gerund = r"(fixing|applying|implementing|inspecting|checking|updating|running|reading|looking|making|changing|adding|writing|creating|reviewing|testing|patching|editing|adjusting|modifying|replacing)"
+    patterns = (
+        rf"^(first,\s+)?(now\s+)?(i'll|i will)\s+(now\s+)?{action}\b.*",
+        rf"^(first,\s+)?(now\s+)?let me\s+(now\s+)?{action}\b.*",
+        rf"^(first,\s+)?(now\s+)?let's\s+{action}\b.*",
+        rf"^(now\s+)?(i'm|i am)\s+going\s+to\s+{action}\b.*",
+        rf"^(now\s+)?going\s+to\s+{action}\b.*",
+        rf"^(now\s+)?{gerund}\b.*",
+        rf".*\b(i'll|i will)\s+(now\s+)?{action}\b.*",
+        rf".*\blet me\s+(now\s+)?{action}\b.*",
+    )
+    return any(re.match(pattern, lower) for pattern in patterns)
+
+
 def normalize_usage(usage: Any) -> dict[str, Any]:
     if not isinstance(usage, dict):
         return {
@@ -631,8 +1809,9 @@ def log_provider_error(normalized: NormalizedRequest, response: httpx.Response) 
     upstream_body = provider_body(response)
     diagnostic = {
         "timestamp": int(time.time()),
+        "provider": response.extensions.get("subagent_router_provider", "unknown"),
         "requested_model": normalized.requested_model,
-        "upstream_model": SETTINGS.deepseek_model or normalized.model,
+        "upstream_model": response.extensions.get("subagent_router_model", normalized.model),
         "upstream_status_code": response.status_code,
         "upstream_response_body": sanitize_diagnostic(upstream_body),
         "stream": normalized.stream,
@@ -668,7 +1847,7 @@ def truncate_large_strings(value: Any) -> Any:
         sanitized: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            if key_text.lower() in {"messages", "input", "prompt", "content", "text", "diff", "reasoning_content"}:
+            if key_text.lower() in {"messages", "input", "prompt", "content", "text", "diff", "reasoning_content", "tool_calls", "arguments"}:
                 sanitized[key_text] = "[OMITTED]"
             else:
                 sanitized[key_text] = truncate_large_strings(item)
@@ -681,37 +1860,3 @@ def truncate_large_strings(value: Any) -> Any:
             return f"{value[:max_length]}...[truncated {len(value) - max_length} chars]"
         return value
     return value
-
-
-def mock_deepseek_response(normalized: NormalizedRequest) -> dict[str, Any]:
-    last_user = next(
-        (message for message in reversed(normalized.messages) if message.get("role") == "user"),
-        {"content": "ok"},
-    )
-    if normalized.tools and "tool" in str(last_user.get("content", "")).lower():
-        tool = normalized.tools[0]["function"]
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_mock_1",
-                                "type": "function",
-                                "function": {
-                                    "name": tool["name"],
-                                    "arguments": json.dumps({"cmd": "echo mock"}, separators=(",", ":")),
-                                },
-                            }
-                        ],
-                    }
-                }
-            ],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-        }
-    return {
-        "choices": [{"message": {"role": "assistant", "content": f"Subagent Router: {last_user['content']}"}}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-    }

@@ -9,7 +9,7 @@ from typing import Any
 
 
 SECRET_KEY_RE = re.compile(
-    r"(authorization|api[_-]?key|token|secret|password|cookie|set-cookie|x-api-key|^env$|environment)",
+    r"(authorization|api[_-]?key|^token$|access[_-]?token|auth[_-]?token|secret|password|cookie|set-cookie|x-api-key|^env$|environment)",
     re.IGNORECASE,
 )
 BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)

@@ -1,7 +1,9 @@
+import datetime
 import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
@@ -25,10 +27,24 @@ class CliTests(unittest.TestCase):
         paths = json.loads(stream.getvalue())
         self.assertEqual(paths["state_dir"], str(Path(state_dir).resolve()))
         self.assertEqual(paths["activity_file"], str(Path(state_dir).resolve() / "logs" / "activity.json"))
+        self.assertIn("providers", paths)
 
     def test_doctor_succeeds_in_mock_mode_without_api_key(self):
         with tempfile.TemporaryDirectory() as state_dir:
             result = cli.main(["doctor", "--state-dir", state_dir, "--mock"])
+
+        self.assertEqual(result, 0)
+
+    def test_doctor_succeeds_for_enabled_local_provider_without_api_key(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            result = cli.main([
+                "doctor",
+                "--state-dir",
+                state_dir,
+                "--provider",
+                "ollama",
+                "--ollama-enabled",
+            ])
 
         self.assertEqual(result, 0)
 
@@ -330,6 +346,189 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result, 1)
         self.assertIn("No server log found", stream.getvalue())
+
+    def test_usage_prints_summary_json(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            usage_file = Path(state_dir) / "logs" / "usage.json"
+            usage_file.parent.mkdir()
+            usage_file.write_text(
+                json.dumps(
+                    {
+                        "request_count": 2,
+                        "total_tokens": 12,
+                        "total_cost_usd": 0.01,
+                        "requests_by_provider": {"deepseek": 2},
+                        "requests_by_model": {"deepseek-chat": 2},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stream = io.StringIO()
+
+            with redirect_stdout(stream):
+                result = cli.main(["usage", "--state-dir", state_dir, "--json"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(stream.getvalue())["request_count"], 2)
+
+    def test_debug_bundle_includes_diagnostic_files(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            root = Path(state_dir)
+            (root / "logs").mkdir()
+            (root / "logs" / "activity.json").write_text("{}", encoding="utf-8")
+            output = root / "bundle.tar.gz"
+            stream = io.StringIO()
+
+            with redirect_stdout(stream):
+                result = cli.main(["debug-bundle", "--state-dir", state_dir, "--output", str(output)])
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output.exists())
+
+    def test_stdio_returns_mock_response_json(self):
+        payload = json.dumps({"model": "deepseek-chat", "stream": False, "input": "hello", "tools": []})
+        stdin = io.StringIO(payload)
+        stdout = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            with patch("sys.stdin", stdin), redirect_stdout(stdout):
+                result = cli.main(["stdio", "--state-dir", state_dir, "--mock"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["output"][0]["type"], "message")
+
+    def test_handoff_once_writes_response_file(self):
+        with tempfile.TemporaryDirectory() as state_dir, tempfile.TemporaryDirectory() as task_dir:
+            task_path = Path(task_dir) / "task.json"
+            task_path.write_text(
+                json.dumps({"model": "deepseek-chat", "stream": False, "input": "hello", "tools": []}),
+                encoding="utf-8",
+            )
+
+            result = cli.main([
+                "handoff",
+                "--state-dir",
+                state_dir,
+                "--mock",
+                "--input-dir",
+                task_dir,
+                "--once",
+            ])
+
+            response = json.loads((Path(task_dir) / "task.response.json").read_text(encoding="utf-8"))
+        self.assertEqual(result, 0)
+        self.assertEqual(response["output"][0]["type"], "message")
+
+    def test_tui_prints_status(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                result = cli.main(["tui", "--state-dir", state_dir, "--mock"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("Subagent Router", stream.getvalue())
+
+    def test_tui_with_watch_refreshes_until_interrupt(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+                    with patch("time.sleep", side_effect=KeyboardInterrupt):
+                        result = cli.main(["tui", "--state-dir", state_dir, "--watch"])
+
+        self.assertEqual(result, 130)
+
+    def test_tui_shows_activity_and_usage(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            logs_dir = Path(state_dir) / "logs"
+            logs_dir.mkdir(parents=True)
+            usage = {
+                "total_cost_usd": 0.025,
+                "daily_usage": {
+                    datetime.date.today().isoformat(): {
+                        "total_cost_usd": 0.025,
+                        "total_tokens": 1200
+                    }
+                }
+            }
+            (logs_dir / "usage.json").write_text(json.dumps(usage), encoding="utf-8")
+            audit_path = logs_dir / "audit.jsonl"
+            audit_path.write_text(
+                json.dumps({
+                    "timestamp": time.time(),
+                    "status": "success",
+                    "provider": "deepseek",
+                    "estimated_cost_usd": 0.005
+                }) + "\n",
+                encoding="utf-8"
+            )
+
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                result = cli.main(["tui", "--state-dir", state_dir])
+
+        self.assertEqual(result, 0)
+        output = stream.getvalue()
+        self.assertIn("Configuration", output)
+        self.assertIn("Budgets", output)
+        self.assertIn("Daily $", output)
+        self.assertIn("Recent Requests", output)
+        self.assertIn("deepseek", output)
+
+    def test_validate_artifacts_passes(self):
+        result = cli.main(["validate-artifacts"])
+        self.assertEqual(result, 0)
+
+    def test_validate_artifacts_json_output(self):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            result = cli.main(["validate-artifacts", "--json"])
+        data = json.loads(stream.getvalue())
+        self.assertEqual(result, 0)
+        self.assertTrue(data["healthy"])
+        self.assertTrue(data["checks"]["version_consistency"])
+        self.assertEqual(data["package_version"], data["pyproject_version"])
+
+    def test_validate_artifacts_allows_missing_pyproject_outside_source_tree(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            src_dir = root / "src" / "subagent_router"
+            docs_dir = root / "docs"
+            bin_dir = root / "bin"
+            src_dir.mkdir(parents=True)
+            docs_dir.mkdir()
+            bin_dir.mkdir()
+            for path in (
+                src_dir / "app.py",
+                src_dir / "settings.py",
+                bin_dir / "subagent-router.js",
+                root / "README.md",
+                docs_dir / "usage.md",
+                docs_dir / "compatibility.md",
+                docs_dir / "test_matrix.md",
+                docs_dir / "ROADMAP.md",
+                docs_dir / "troubleshooting.md",
+            ):
+                path.write_text("", encoding="utf-8")
+            (root / "package.json").write_text('{"version":"0.1.9"}', encoding="utf-8")
+
+            old_file = cli.__file__
+            cli.__file__ = str(src_dir / "cli.py")
+            try:
+                stream = io.StringIO()
+                with redirect_stdout(stream):
+                    result = cli.main(["validate-artifacts", "--json"])
+            finally:
+                cli.__file__ = old_file
+
+        data = json.loads(stream.getvalue())
+        self.assertEqual(result, 0)
+        self.assertTrue(data["healthy"])
+        self.assertFalse(data["checks"]["pyproject_toml_exists"])
+        self.assertEqual(data["checks"]["version_consistency"], "0.1.9")
+        self.assertEqual(data["package_version"], "0.1.9")
+        self.assertIsNone(data["pyproject_version"])
+        self.assertTrue(data["warnings"])
 
     def test_logs_prints_trailing_lines(self):
         with tempfile.TemporaryDirectory() as state_dir:

@@ -1,6 +1,6 @@
 {
   "name": "subagent-router",
-  "version": "0.1.3",
+  "version": "0.2.1",
   "description": "Route subagent work from primary coding agents to local, low-cost, or cloud model backends.",
   "type": "commonjs",
   "bin": {
@@ -10,7 +10,12 @@
   "files": [
     "bin/",
     "src/",
+    "!src/**/*.egg-info/",
+    "!src/**/*.py[cod]",
+    "!src/**/__pycache__/",
+    "pyproject.toml",
     "README.md",
+    "CHANGELOG.md",
     "docs/"
   ],
   "engines": {

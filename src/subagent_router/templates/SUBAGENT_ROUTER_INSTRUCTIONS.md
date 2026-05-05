@@ -70,6 +70,13 @@ If `session_mirror.final` is non-null but `wait_agent` still did not complete,
 report that the proxy saw a final provider response, include
 `session_mirror.final.messages`, and stop.
 
+If `wait_agent` returns a final/complete response that is empty, null, or only
+a progress line such as "Now I'll fix both call sites:", send `continue` or a
+concise instruction to the same agent via `send_input` asking it to finish with
+changed files, tests run, and results, then call `wait_agent` once more. If the
+agent repeats invalid final output, stop and report the trace id and sanitized
+session mirror information.
+
 If both files are missing or stale, stop and report that proxy session activity
 is not visible.
 

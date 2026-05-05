@@ -2,13 +2,9 @@
 
 Route subagent work from primary coding agents to local, low-cost, or cloud model backends.
 
-Subagent Router lets primary coding agents delegate subagent tasks to alternate model backends such as DeepSeek, Ollama, OpenRouter, and other OpenAI-compatible providers.
+Subagent Router lets primary coding agents delegate subagent tasks to alternate model backends such as **DeepSeek**, **Ollama**, **Groq**, and other OpenAI-compatible providers. It features a robust routing engine, fallback logic, and granular budget controls to ensure privacy, performance, and cost-efficiency.
 
-The current Codex integration talks to this proxy through a local
-`/v1/responses` HTTP endpoint. The current DeepSeek backend converts Codex
-Responses requests to DeepSeek chat/completions requests, then converts
-DeepSeek responses back to Responses JSON or SSE. The primary coding agent
-remains responsible for executing tools.
+The current Codex integration talks to this proxy through a local `/v1/responses` HTTP endpoint. The proxy normalizes requests to various backend formats, manages streaming SSE, and tracks usage across tasks, sessions, and days.
 
 ## Install
 
@@ -27,19 +23,12 @@ python -m venv .venv
 pip install -e '.[server]'
 ```
 
-For local npm package testing from this checkout:
-
-```shell
-npm pack
-npm install -g ./subagent-router-0.1.2.tgz
-```
-
 ## Quick Start
 
-Check the CLI:
+Check your configuration:
 
 ```shell
-subagent-router --help
+subagent-router doctor
 subagent-router paths
 ```
 
@@ -49,33 +38,15 @@ Install Codex integration files:
 subagent-router init
 ```
 
-Default init mode writes the full Subagent Router delegation instructions to
-`~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md` and adds
-`Follow instructions in ~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md` as the first line of
-`~/.codex/AGENTS.md`. Existing `AGENTS.md` content stays below it.
-
-
-
 Start the proxy:
 
 ```shell
+# Foreground
 DEEPSEEK_API_KEY=... subagent-router start
-```
 
-Start it in the background and attach logs when needed:
-
-```shell
+# Background
 DEEPSEEK_API_KEY=... subagent-router start --background
-subagent-router logs --follow
-subagent-router status
-subagent-router restart
-subagent-router stop
-```
-
-For deterministic local smoke tests without a DeepSeek key:
-
-```shell
-subagent-router start --mock
+subagent-router tui --watch
 ```
 
 Run Codex with an ephemeral proxy:
@@ -84,52 +55,44 @@ Run Codex with an ephemeral proxy:
 DEEPSEEK_API_KEY=... subagent-router run -- codex
 ```
 
-`subagent-router run --` starts the proxy on a free loopback port, injects temporary Codex
-provider config with `-c`, runs the requested command, and stops the proxy when
-the command exits.
+## Features
 
-## Commands
-
-```shell
-subagent-router init
-subagent-router start
-subagent-router start --background
-subagent-router stop
-subagent-router restart
-subagent-router status
-subagent-router logs --follow
-subagent-router run -- codex ...
-subagent-router doctor
-subagent-router paths
-subagent-router install-service
-```
-
-`sar` is also installed as a short alias for `subagent-router`.
+- **Multi-Provider Routing**: Seamlessly switch between DeepSeek, local Ollama, and OpenAI-compatible endpoints (Groq, vLLM, etc.).
+- **Smart Fallbacks**: Automatically retry failed requests on alternative backends.
+- **Budget Controls**: Hard-stop or warn based on token usage or dollar cost per-task, per-session, or per-day.
+- **Observability**: Structured audit logs with deep token tracking (in/cache/out), real-time usage tracking, and a lightweight interactive Terminal UI (`tui`).
+- **Protocol Flexibility**: First-class support for the Codex internal Responses protocol, while also transparently accepting standard OpenAI `/v1/chat/completions` `messages` payloads for drop-in compatibility with curl and standard libraries.
 
 ## Configuration
 
-Minimum real-provider configuration:
+The router can be configured via environment variables or a `config.toml` file.
 
-```shell
-export DEEPSEEK_API_KEY=...
+### Common Environment Variables
+
+- `SUBAGENT_ROUTER_PROVIDER`: Default provider (`deepseek`, `ollama`, `openai-compatible`)
+- `SUBAGENT_ROUTER_BUDGET_MODE`: `warn` (default) or `hard-stop`
+- `SUBAGENT_ROUTER_MAX_COST_PER_DAY`: Maximum daily spend in USD
+- `SUBAGENT_ROUTER_MAX_TOKENS_PER_SESSION`: Token budget for the current session
+
+### Example Config (`config.toml`)
+
+```toml
+[providers.groq]
+type = "openai-compatible"
+base_url = "https://api.groq.com/openai/v1"
+model = "llama-3.3-70b-versatile"
+
+[budgets]
+max_cost_per_task = 0.05
+max_cost_per_day = 5.00
+mode = "hard-stop"
 ```
-
-Common options:
-
-- `DEEPSEEK_BASE_URL`: defaults to `https://api.deepseek.com/v1`
-- `DEEPSEEK_MODEL`: optional upstream model override
-- `SUBAGENT_ROUTER_HOST`: defaults to `127.0.0.1`
-- `SUBAGENT_ROUTER_PORT`: defaults to `8787`
-- `SUBAGENT_ROUTER_STATE_DIR`: defaults to `$XDG_STATE_HOME/subagent-router`
-  or `~/.local/state/subagent-router`
 
 More configuration details are in [docs/usage.md](docs/usage.md).
 
 ## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the planned provider abstraction,
-local model support, routing policies, usage tracking, cost controls,
-observability, optional terminal UI, and future primary-agent integrations.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for implemented and planned features including intelligent provider scoring and advanced routing policies.
 
 ## Documentation
 
@@ -137,7 +100,10 @@ observability, optional terminal UI, and future primary-agent integrations.
 - [Architecture and behavior](docs/proxy_requirements.md)
 - [Protocol notes](docs/protocol_findings.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [Provider compatibility](docs/compatibility.md)
 - [Test matrix](docs/test_matrix.md)
+- [Release checklist](docs/release_checklist.md)
+- [Changelog](CHANGELOG.md)
 
 ## Development
 

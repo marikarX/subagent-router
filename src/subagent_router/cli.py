@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from collections import deque
 import hashlib
 import json
@@ -10,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import time
 import tomllib
 from importlib.metadata import PackageNotFoundError
@@ -36,6 +38,7 @@ MANIFEST_FILENAME = ".subagent-router-manifest.json"
 LEGACY_MANAGED_HASHES: dict[str, tuple[str, ...]] = {}
 _CHILD_SECRET_KEYS: frozenset[str] = frozenset({
     "DEEPSEEK_API_KEY",
+    "OPENAI_COMPAT_API_KEY",
 })
 
 
@@ -97,7 +100,35 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_settings_args(logs)
     logs.add_argument("-f", "--follow", action="store_true", help="follow log output")
     logs.add_argument("--lines", type=int, default=80, help="number of trailing lines to print")
+    logs.add_argument("--audit", action="store_true", help="print the audit JSONL log instead of server output")
     logs.set_defaults(handler=cmd_logs)
+
+    usage = subcommands.add_parser("usage", help="print usage and cost summary")
+    add_common_settings_args(usage)
+    usage.add_argument("--json", action="store_true", help="print JSON")
+    usage.set_defaults(handler=cmd_usage)
+
+    debug_bundle = subcommands.add_parser("debug-bundle", help="write a redacted troubleshooting bundle")
+    add_common_settings_args(debug_bundle)
+    debug_bundle.add_argument("--output", default=None, help="output .tar.gz path")
+    debug_bundle.set_defaults(handler=cmd_debug_bundle)
+
+    stdio = subcommands.add_parser("stdio", help="read one Responses JSON request from stdin and write one JSON response")
+    add_common_settings_args(stdio)
+    stdio.set_defaults(handler=cmd_stdio)
+
+    handoff = subcommands.add_parser("handoff", help="process JSON task files from a directory")
+    add_common_settings_args(handoff)
+    handoff.add_argument("--input-dir", required=True)
+    handoff.add_argument("--output-dir", default=None)
+    handoff.add_argument("--once", action="store_true", help="process currently available files and exit")
+    handoff.add_argument("--poll-interval", type=float, default=1.0)
+    handoff.set_defaults(handler=cmd_handoff)
+
+    tui = subcommands.add_parser("tui", help="print a compact terminal status view")
+    add_common_settings_args(tui)
+    tui.add_argument("--watch", action="store_true", help="continuously refresh status every 2 seconds")
+    tui.set_defaults(handler=cmd_tui)
 
     run = subcommands.add_parser("run", help="start the proxy for one command")
     add_common_settings_args(run)
@@ -140,6 +171,10 @@ def build_parser() -> argparse.ArgumentParser:
     service.add_argument("--force", action="store_true")
     service.set_defaults(handler=cmd_install_service)
 
+    validate = subcommands.add_parser("validate-artifacts", help="validate release artifacts for packaging consistency")
+    validate.add_argument("--json", action="store_true", help="print JSON results")
+    validate.set_defaults(handler=cmd_validate_artifacts)
+
     return parser
 
 
@@ -151,8 +186,24 @@ def add_common_settings_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--activity-file", default=None)
     parser.add_argument("--session-mirror-file", default=None)
     parser.add_argument("--provider-error-log-dir", default=None)
+    parser.add_argument("--audit-log-file", default=None)
+    parser.add_argument("--usage-file", default=None)
+    parser.add_argument("--provider", default=None, help="default provider name")
+    parser.add_argument("--fallback-providers", default=None, help="comma-separated fallback provider names")
     parser.add_argument("--deepseek-base-url", default=None)
     parser.add_argument("--model", default=None, help="override upstream DeepSeek model")
+    parser.add_argument("--openai-compatible-base-url", default=None)
+    parser.add_argument("--openai-compatible-api-key", default=None)
+    parser.add_argument("--openai-compatible-model", default=None)
+    parser.add_argument("--ollama-base-url", default=None)
+    parser.add_argument("--ollama-model", default=None)
+    parser.add_argument("--ollama-enabled", action="store_true")
+    parser.add_argument("--max-cost-per-task", default=None)
+    parser.add_argument("--max-tokens-per-task", type=int, default=None)
+    parser.add_argument("--budget-mode", choices=("warn", "hard-stop"), default=None)
+    parser.add_argument("--provider-allowlist", default=None)
+    parser.add_argument("--provider-denylist", default=None)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--mock", action="store_true", help="use deterministic local mock responses")
     parser.add_argument("--trace", action="store_true", help="print compact proxy trace output")
     parser.add_argument("--allow-apply-patch", action="store_true")
@@ -169,8 +220,22 @@ def settings_from_args(args: argparse.Namespace, *, ephemeral_port: bool = False
         "SUBAGENT_ROUTER_ACTIVITY_FILE": args.activity_file,
         "SUBAGENT_ROUTER_SESSION_MIRROR_FILE": args.session_mirror_file,
         "SUBAGENT_ROUTER_PROVIDER_ERROR_LOG_DIR": args.provider_error_log_dir,
+        "SUBAGENT_ROUTER_AUDIT_LOG_FILE": args.audit_log_file,
+        "SUBAGENT_ROUTER_USAGE_FILE": args.usage_file,
+        "SUBAGENT_ROUTER_PROVIDER": args.provider,
+        "SUBAGENT_ROUTER_FALLBACK_PROVIDERS": args.fallback_providers,
         "DEEPSEEK_BASE_URL": args.deepseek_base_url,
         "DEEPSEEK_MODEL": args.model,
+        "OPENAI_COMPAT_BASE_URL": args.openai_compatible_base_url,
+        "OPENAI_COMPAT_API_KEY": args.openai_compatible_api_key,
+        "OPENAI_COMPAT_MODEL": args.openai_compatible_model,
+        "OLLAMA_BASE_URL": args.ollama_base_url,
+        "OLLAMA_MODEL": args.ollama_model,
+        "SUBAGENT_ROUTER_MAX_COST_PER_TASK": args.max_cost_per_task,
+        "SUBAGENT_ROUTER_MAX_TOKENS_PER_TASK": str(args.max_tokens_per_task) if args.max_tokens_per_task is not None else None,
+        "SUBAGENT_ROUTER_BUDGET_MODE": args.budget_mode,
+        "SUBAGENT_ROUTER_PROVIDER_ALLOWLIST": args.provider_allowlist,
+        "SUBAGENT_ROUTER_PROVIDER_DENYLIST": args.provider_denylist,
     }
     for key, value in arg_env.items():
         if value is not None:
@@ -183,6 +248,10 @@ def settings_from_args(args: argparse.Namespace, *, ephemeral_port: bool = False
         env["DEEPSEEK_ALLOW_APPLY_PATCH"] = "1"
     if args.send_parallel_tool_calls:
         env["DEEPSEEK_SEND_PARALLEL_TOOL_CALLS"] = "1"
+    if args.ollama_enabled:
+        env["OLLAMA_ENABLED"] = "1"
+    if args.dry_run:
+        env["SUBAGENT_ROUTER_DRY_RUN"] = "1"
     if ephemeral_port and args.port is None:
         port = free_loopback_port(args.host or "127.0.0.1")
         env["SUBAGENT_ROUTER_PORT"] = str(port)
@@ -244,11 +313,781 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_logs(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
-    path = server_log_file(settings)
+    path = settings.audit_log_file if args.audit else server_log_file(settings)
     if not path.exists():
-        print(f"No server log found at {path}", file=sys.stderr)
+        kind = "audit log" if args.audit else "server log"
+        print(f"No {kind} found at {path}", file=sys.stderr)
         return 1
     return print_log(path, lines=args.lines, follow=args.follow)
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    settings = settings_from_args(args)
+    if not settings.usage_file.exists():
+        summary = {
+            "request_count": 0,
+            "total_tokens": 0,
+            "total_cost_usd": 0.0,
+            "requests_by_provider": {},
+            "requests_by_model": {},
+        }
+    else:
+        try:
+            summary = json.loads(settings.usage_file.read_text(encoding="utf-8"))
+            if not isinstance(summary, dict):
+                raise ValueError("usage summary is not an object")
+        except (OSError, ValueError, json.JSONDecodeError):
+            summary = {
+                "request_count": 0,
+                "total_tokens": 0,
+                "total_cost_usd": 0.0,
+                "requests_by_provider": {},
+                "requests_by_model": {},
+            }
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
+    print(f"requests: {summary.get('request_count', 0)}")
+    print(f"tokens: {summary.get('total_tokens', 0)}")
+    print(f"estimated_cost_usd: {summary.get('total_cost_usd', 0.0)}")
+    for provider, count in sorted((summary.get("requests_by_provider") or {}).items()):
+        print(f"provider.{provider}: {count}")
+    for model, count in sorted((summary.get("requests_by_model") or {}).items()):
+        print(f"model.{model}: {count}")
+    return 0
+
+
+def cmd_debug_bundle(args: argparse.Namespace) -> int:
+    settings = settings_from_args(args)
+    output = Path(args.output).expanduser().resolve() if args.output else settings.state_dir / f"debug-bundle-{int(time.time())}.tar.gz"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    candidates = [
+        settings.activity_file,
+        settings.session_mirror_file,
+        settings.audit_log_file,
+        settings.usage_file,
+        server_log_file(settings),
+    ]
+    with tarfile.open(output, "w:gz") as bundle:
+        for path in candidates:
+            if path.exists() and path.is_file():
+                bundle.add(path, arcname=path.name)
+    print(f"Wrote {output}")
+    return 0
+
+
+def cmd_stdio(args: argparse.Namespace) -> int:
+    payload = json.loads(sys.stdin.read() or "{}")
+    if not isinstance(payload, dict):
+        print("stdio: expected a JSON object", file=sys.stderr)
+        return 2
+    settings = settings_from_args(args)
+    try:
+        response = process_handoff_payload(settings, payload)
+    except Exception as exc:
+        print(f"stdio: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(response, sort_keys=True))
+    return 0
+
+
+def process_handoff_payload(settings: Settings, payload: dict) -> dict:
+    import subagent_router.app as proxy_app
+    from subagent_router.normalization import PayloadNormalizationError, normalize_request
+
+    old_settings = proxy_app.SETTINGS
+    proxy_app.SETTINGS = settings
+    try:
+        normalized = normalize_request(
+            payload,
+            allow_apply_patch_enabled=settings.apply_patch_override(),
+        )
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        route = proxy_app.RouteSelection(
+            str(metadata.get("provider") or settings.provider),
+            str(metadata["model"]) if metadata.get("model") else None,
+            settings.fallback_providers,
+            str(metadata.get("routing_policy") or metadata.get("policy") or "handoff"),
+            "handoff request",
+        )
+        provider_result = (
+            proxy_app.dry_run_provider_response(normalized, route)
+            if settings.dry_run or payload.get("dry_run") is True
+            else asyncio.run(proxy_app.call_provider(normalized, route))
+        )
+        return proxy_app.responses_object(
+            payload,
+            normalized,
+            provider_result.chat_response,
+            provider_result=provider_result,
+            route=route,
+        )
+    except PayloadNormalizationError:
+        raise
+    finally:
+        proxy_app.SETTINGS = old_settings
+
+
+def cmd_handoff(args: argparse.Namespace) -> int:
+    settings = settings_from_args(args)
+    input_dir = Path(args.input_dir).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else input_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        processed = process_handoff_files(settings, input_dir, output_dir)
+        if args.once:
+            return 0 if processed >= 0 else 1
+        time.sleep(args.poll_interval)
+
+
+def process_handoff_files(settings: Settings, input_dir: Path, output_dir: Path) -> int:
+    count = 0
+    for path in sorted(input_dir.glob("*.json")):
+        if path.name.endswith(".response.json") or path.name.endswith(".error.json"):
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("task file must contain a JSON object")
+            result = process_handoff_payload(settings, payload)
+            (output_dir / f"{path.stem}.response.json").write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            (output_dir / f"{path.stem}.error.json").write_text(
+                json.dumps({"error": str(exc)}, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        count += 1
+    return count
+
+
+def cmd_tui(args: argparse.Namespace) -> int:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.layout import Layout
+    from rich import box
+    import httpx
+
+    settings = settings_from_args(args)
+    console = Console()
+    base_url = f"http://{settings.host}:{settings.port}"
+
+    def get_remote_config():
+        try:
+            resp = httpx.get(f"{base_url}/v1/config", timeout=1.0)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
+    def patch_remote_config(updates):
+        try:
+            httpx.patch(f"{base_url}/v1/config", json=updates, timeout=2.0)
+            return True
+        except Exception:
+            return False
+
+    def check_remote_provider(name):
+        try:
+            resp = httpx.get(f"{base_url}/v1/check-provider/{name}", timeout=6.0)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return {"available": False, "error": "Router unreachable"}
+
+    def apply_model_assignment(pname, new_model, role):
+        if role == "default":
+            return patch_remote_config({"provider_models": {pname: new_model}})
+        elif role == "worker":
+            return patch_remote_config({"routing_policies": {"safe-default": {"model": new_model}}})
+        elif role == "reviewer":
+            return patch_remote_config({"routing_policies": {"cheap-review": {"model": new_model}}})
+        return False
+
+    def generate_dashboard(remote_config=None) -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="main"),
+            Layout(name="footer", size=3),
+        )
+
+        # Header
+        layout["header"].update(Panel(f"[bold cyan]Subagent Router Control Panel[/bold cyan] | Host: [dim]{settings.host}:{settings.port}[/dim]", box=box.ROUNDED))
+
+        # Main Content
+        main_layout = Layout()
+        main_layout.split_column(
+            Layout(name="stats", size=10),
+            Layout(name="activity"),
+        )
+
+        main_table = Table.grid(expand=True)
+        main_table.add_column(ratio=1)
+        main_table.add_column(ratio=1)
+
+        # Config Panel
+        current_provider = remote_config.get("provider") if remote_config else settings.provider
+        current_mode = remote_config.get("budget_mode") if remote_config else settings.budget_mode
+        config_info = Table(show_header=False, box=None)
+        config_info.add_row("[bold]Status:[/bold]", "[green]UP[/green]" if remote_config else "[red]DOWN[/red]")
+        config_info.add_row("[bold]Provider:[/bold]", f"[magenta]{current_provider}[/magenta]")
+        config_info.add_row("[bold]Budget Mode:[/bold]", f"[yellow]{current_mode}[/yellow]")
+        config_info.add_row("[bold]Fallbacks:[/bold]", ", ".join(settings.fallback_providers) or "none")
+
+        # Budget Panel
+        budget_table = Table(show_header=False, box=None)
+        if settings.usage_file.exists():
+            try:
+                import datetime
+                usage = json.loads(settings.usage_file.read_text(encoding="utf-8"))
+                today = datetime.date.today().isoformat()
+                day_data = usage.get("daily_usage", {}).get(today, {})
+                daily_cost = float(day_data.get("total_cost_usd", 0.0))
+                daily_tokens = int(day_data.get("total_tokens", 0))
+
+                max_cost = remote_config.get("max_cost_per_day") if remote_config else settings.max_cost_per_day
+
+                cost_color = "green"
+                if max_cost and daily_cost >= max_cost: cost_color = "red"
+                elif max_cost and daily_cost >= max_cost * 0.8: cost_color = "yellow"
+
+                budget_table.add_row("[bold]Daily USD:[/bold]", f"[{cost_color}]{daily_cost:>8.4f}$[/{cost_color}] / {max_cost or 0:.4f}$")
+                budget_table.add_row("[bold]Daily Toks:[/bold]", f"{daily_tokens:>8} / {settings.max_tokens_per_day or 'unlimited'}")
+            except Exception:
+                budget_table.add_row("[yellow](budget error)[/yellow]")
+        else:
+            budget_table.add_row("[dim]No usage data[/dim]")
+
+        main_table.add_row(
+            Panel(config_info, title="System Configuration", border_style="cyan"),
+            Panel(budget_table, title="Budget Status", border_style="yellow")
+        )
+        main_layout["stats"].update(main_table)
+
+        # Activity Panel
+        activity_table = Table(box=None, expand=True)
+        activity_table.add_column("Time", style="dim")
+        activity_table.add_column("Status")
+        activity_table.add_column("Provider")
+        activity_table.add_column("Toks (in/cache/out)", justify="right")
+        activity_table.add_column("Cost", justify="right")
+
+        if settings.audit_log_file.exists():
+            try:
+                with settings.audit_log_file.open("rb") as f:
+                    f.seek(0, 2)
+                    size = f.tell()
+                    f.seek(max(0, size - 4096))
+                    tail = f.read().decode("utf-8", errors="replace")
+                lines = [l for l in tail.strip().split("\n") if l.strip()]
+                for al in lines[-5:][::-1]:
+                    entry = json.loads(al)
+                    raw_ts = entry.get("timestamp")
+                    ts = datetime.datetime.fromtimestamp(raw_ts).strftime("%H:%M:%S") if isinstance(raw_ts, (int, float)) else "??:??:??"
+                    status = "[green]OK[/green]" if entry.get("status") in ("success", "ok") else "[red]ERR[/red]"
+
+                    usage = entry.get("usage") or {}
+                    t_in = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+                    t_out = usage.get("completion_tokens", usage.get("output_tokens", 0))
+                    t_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+                    t_cached = t_details.get("cached_tokens", 0)
+                    if t_in > 0 or t_out > 0:
+                        t_str = f"[cyan]{t_in}[/cyan] / [green]{t_cached}[/green] / [magenta]{t_out}[/magenta]"
+                    else:
+                        t_str = ""
+
+                    activity_table.add_row(ts, status, entry.get("provider", "???"), t_str, f"${entry.get('estimated_cost_usd', 0.0):.4f}")
+            except Exception:
+                activity_table.add_row("", "[yellow]Audit log error[/yellow]", "", "", "")
+        else:
+            activity_table.add_row("", "[dim]No activity yet[/dim]", "", "", "")
+
+        main_layout["activity"].update(Panel(activity_table, title="Recent Requests", border_style="magenta"))
+        layout["main"].update(main_layout)
+
+        # Footer
+        layout["footer"].update(Panel(r"[bold]Actions:[/bold] [white]\[P] Provider | \[B] Budget | \[M] Mode | \[R] Reset | \[Q] Quit[/white]", border_style="white"))
+
+        return layout
+
+    from threading import Thread, Event
+    import queue
+
+    input_queue = queue.Queue()
+    stop_event = Event()
+    is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+
+    def input_thread_func():
+        import sys, tty, termios
+        if not is_tty:
+            return
+
+        try:
+            fd = sys.stdin.fileno()
+        except (AttributeError, io.UnsupportedOperation):
+            return
+
+        try:
+            old_settings = termios.tcgetattr(fd)
+        except termios.error:
+            return
+
+        try:
+            # cbreak mode: single-key input (no line buffering, no echo)
+            # but PRESERVES output processing so Rich can render properly.
+            # (setraw would disable ONLCR, breaking \n → \r\n translation
+            # and garbling all Rich layout output)
+            tty.setcbreak(fd)
+            while not stop_event.is_set():
+                ch = sys.stdin.read(1)
+                if not ch:
+                    break
+                input_queue.put(ch)
+        except Exception:
+            pass
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
+    # TUI State
+    class TUIState:
+        def __init__(self):
+            self.menu = "main"
+            self.last_config = get_remote_config()
+            self.last_refresh = 0
+            self.message = ""
+            self.message_expiry = 0
+            self.needs_update = True
+            # Budget input state
+            self.budget_field = None      # which field is being edited
+            self.budget_input = ""        # accumulated digits
+            self.budget_field_key = None  # API key for PATCH
+            # Provider health and models
+            self.provider_health = {}     # provider name -> availability result
+            self.available_models = {}   # provider name -> list of models
+            self.model_menu_provider = None
+            self.model_menu_options = []
+            self.model_input = ""
+            self.model_menu_role = "default"  # "default", "worker", "reviewer"
+
+    state = TUIState()
+
+    # Initial health check for current provider
+    cp = (state.last_config.get("provider") if state.last_config else settings.provider)
+    def initial_check(pname):
+        state.provider_health[pname] = check_remote_provider(pname)
+        state.needs_update = True
+    Thread(target=initial_check, args=(cp,), daemon=True).start()
+
+    # Budget menu field definitions
+    BUDGET_FIELDS = [
+        ("1", "Daily Cost Limit ($)",      "max_cost_per_day",      "float"),
+        ("2", "Daily Token Limit",         "max_tokens_per_day",    "int"),
+        ("3", "Session Cost Limit ($)",    "max_cost_per_session",  "float"),
+        ("4", "Session Token Limit",       "max_tokens_per_session","int"),
+        ("5", "Per-Task Cost Limit ($)",   "max_cost_per_task",     "float"),
+        ("6", "Per-Task Token Limit",      "max_tokens_per_task",   "int"),
+    ]
+
+    def build_dashboard_content():
+        """Build the inner content renderables for the dashboard panels."""
+        import datetime as dt
+        remote = state.last_config
+        current_provider = remote.get("provider") if remote else settings.provider
+        current_mode = remote.get("budget_mode") if remote else settings.budget_mode
+
+        # Config info
+        config_info = Table(show_header=False, box=None, padding=(0, 1))
+        config_info.add_row("[bold]Status:[/bold]", "[green]UP[/green]" if remote else "[red]DOWN[/red]")
+
+        health = state.provider_health.get(current_provider, {})
+        if health:
+            avail = "[green]Online[/green]" if health.get("available") else f"[red]Offline[/red]"
+            config_info.add_row("[bold]Health:[/bold]", avail)
+
+        config_info.add_row("[bold]Provider:[/bold]", f"[magenta]{current_provider}[/magenta]")
+        model_name = "unknown"
+        if remote:
+            model_name = remote.get('providers', {}).get(current_provider, {}).get('model')
+        if not model_name:
+            provider_cfg = settings.providers.get(current_provider)
+            model_name = provider_cfg.model if provider_cfg else 'unknown'
+
+        config_info.add_row("[bold]Model:[/bold]", f"[cyan]{model_name}[/cyan]")
+        config_info.add_row("[bold]Budget Mode:[/bold]", f"[yellow]{current_mode}[/yellow]")
+        config_info.add_row("[bold]Fallbacks:[/bold]", f"[dim]{', '.join(settings.fallback_providers) or 'none'}[/dim]")
+
+        # Show API pricing per provider in config panel
+        cfg = remote or {}
+        pricing = cfg.get("provider_pricing") or {}
+        if pricing:
+            config_info.add_row("", "")  # spacer
+            for pname, pdata in pricing.items():
+                inp = pdata.get("input_cost_per_million")
+                out = pdata.get("output_cost_per_million")
+                hint = pdata.get("cost_hint", "")
+                if inp is not None or out is not None:
+                    rate_str = f"[dim]in[/dim] ${inp or 0:.2f}  [dim]out[/dim] ${out or 0:.2f}"
+                elif hint == "zero-api-cost":
+                    rate_str = "[green]free (local)[/green]"
+                else:
+                    rate_str = "[dim]unknown[/dim]"
+                config_info.add_row(f"[bold]{pname}:[/bold]", rate_str)
+
+        # Budget info — comprehensive view
+        budget_info = Table(show_header=False, box=None, padding=(0, 1))
+
+        def _fmt_cost(v):
+            return f"${v:.4f}" if v is not None else "[dim]none[/dim]"
+        def _fmt_tokens(v):
+            return f"{v:,}" if v is not None else "[dim]none[/dim]"
+
+        budget_info.add_row("[bold]Daily $:[/bold]",   _fmt_cost(cfg.get("max_cost_per_day") or settings.max_cost_per_day))
+        budget_info.add_row("[bold]Daily Tok:[/bold]",  _fmt_tokens(cfg.get("max_tokens_per_day") or settings.max_tokens_per_day))
+        budget_info.add_row("[bold]Session $:[/bold]", _fmt_cost(cfg.get("max_cost_per_session") or settings.max_cost_per_session))
+        budget_info.add_row("[bold]Task $:[/bold]",    _fmt_cost(cfg.get("max_cost_per_task") or settings.max_cost_per_task))
+
+        # Per-provider cost limits
+        prov_costs = cfg.get("max_cost_per_provider") or settings.max_cost_per_provider or {}
+        if prov_costs:
+            for pname, pcost in prov_costs.items():
+                budget_info.add_row(f"[bold]{pname} cap:[/bold]", _fmt_cost(pcost))
+
+        if settings.usage_file.exists():
+            try:
+                usage = json.loads(settings.usage_file.read_text(encoding="utf-8"))
+                today = dt.date.today().isoformat()
+                day_data = usage.get("daily_usage", {}).get(today, {})
+                daily_cost = float(day_data.get("total_cost_usd", 0.0))
+                daily_tokens = int(day_data.get("total_tokens", 0))
+                max_cost = cfg.get("max_cost_per_day") or settings.max_cost_per_day
+                cost_color = "green"
+                if max_cost and daily_cost >= max_cost: cost_color = "red"
+                elif max_cost and daily_cost >= max_cost * 0.8: cost_color = "yellow"
+                budget_info.add_row("", "")  # spacer
+                budget_info.add_row("[bold]Today $:[/bold]", f"[{cost_color}]{daily_cost:.4f}[/{cost_color}]")
+                budget_info.add_row("[bold]Today Tok:[/bold]", f"{daily_tokens:,}")
+            except Exception:
+                pass
+
+        # Activity table
+        activity_table = Table(box=None, expand=True, header_style="bold magenta")
+        activity_table.add_column("Time", style="dim", width=10)
+        activity_table.add_column("Status", width=8)
+        activity_table.add_column("Provider", width=15)
+        activity_table.add_column("Model", width=25)
+        activity_table.add_column("Toks (in/cache/out)", justify="right")
+        activity_table.add_column("Cost", justify="right")
+
+        if settings.audit_log_file.exists():
+            try:
+                with settings.audit_log_file.open("rb") as f:
+                    f.seek(0, 2)
+                    size = f.tell()
+                    f.seek(max(0, size - 4096))
+                    tail = f.read().decode("utf-8", errors="replace")
+                lines = [l for l in tail.strip().split("\n") if l.strip()]
+                for al in lines[-5:][::-1]:
+                    entry = json.loads(al)
+                    raw_ts = entry.get("timestamp")
+                    ts = dt.datetime.fromtimestamp(raw_ts).strftime("%H:%M:%S") if isinstance(raw_ts, (int, float)) else "??:??:??"
+                    st = "[green]OK[/green]" if entry.get("status") in ("success", "ok") else "[red]ERR[/red]"
+
+                    usage = entry.get("usage") or {}
+                    try:
+                        t_in = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
+                        t_out = int(usage.get("completion_tokens", usage.get("output_tokens", 0)))
+                        t_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+                        t_cached = int(t_details.get("cached_tokens", 0))
+                    except (ValueError, TypeError):
+                        t_in = t_out = t_cached = 0
+
+                    if t_in > 0 or t_out > 0:
+                        t_str = f"[cyan]{t_in}[/cyan] / [green]{t_cached}[/green] / [magenta]{t_out}[/magenta]"
+                    else:
+                        t_str = ""
+
+                    activity_table.add_row(ts, st, entry.get("provider", "???"), str(entry.get("model", "???")), t_str, f"${entry.get('estimated_cost_usd', 0.0):.4f}")
+            except Exception:
+                activity_table.add_row("", "[yellow]Audit log error[/yellow]", "", "", "", "")
+        else:
+            activity_table.add_row("", "[dim]No activity yet[/dim]", "", "", "", "")
+
+        # Footer text — context-sensitive
+        if state.menu == "provider":
+            footer_text = "[bold yellow]Switch Provider:[/bold yellow] [1] DeepSeek  [2] Groq  [3] Ollama  [Any] Back"
+        elif state.menu == "model_role":
+            footer_text = "[bold yellow]Assign Model to Role:[/bold yellow] [1] Global Default  [2] Worker  [3] Reviewer  [Any] Back"
+        elif state.menu == "model":
+            footer_text = f"[bold yellow]{state.model_menu_role.upper()} model for {state.model_menu_provider}:[/bold yellow] "
+            opts = []
+            for i, opt in enumerate(state.model_menu_options[:9]):
+                opts.append(f"[{i+1}] {opt}")
+            footer_text += "  ".join(opts) + r"  [white]\[M] Manual[/white]  [Any] Back"
+        elif state.menu == "model_input":
+            footer_text = f"[bold cyan]Enter model for {state.model_menu_provider}:[/bold cyan] [white]{state.model_input}▌[/white]  (Enter=Apply  Esc=Cancel)"
+        elif state.menu == "budget":
+            lines_parts = ["[bold yellow]Budget Config:[/bold yellow]"]
+            for key, label, api_key, ftype in BUDGET_FIELDS:
+                lines_parts.append(f"[{key}] {label}")
+            lines_parts.append("[0] Back")
+            footer_text = "  ".join(lines_parts)
+        elif state.menu == "budget_input":
+            footer_text = f"[bold cyan]Set {state.budget_field}:[/bold cyan] [white]{state.budget_input}▌[/white]  (Enter=Apply  Esc/0=Cancel)"
+        elif state.message:
+            footer_text = state.message
+        else:
+            footer_text = r"[bold]Actions:[/bold]  \[P] Provider  \[L] Model  \[B] Budget  \[M] Mode  \[R] Reset  \[Q] Quit"
+
+        return config_info, budget_info, activity_table, footer_text
+
+    def make_layout():
+        """Create a Layout that fills exactly one terminal screen."""
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="stats", size=14),
+            Layout(name="activity"),
+            Layout(name="footer", size=3),
+        )
+        return layout
+
+    def update_layout(layout):
+        """Populate the layout panels with current data."""
+        config_info, budget_info, activity_table, footer_text = build_dashboard_content()
+
+        layout["header"].update(Panel(
+            f"[bold cyan]Subagent Router[/bold cyan] | [dim]{settings.host}:{settings.port}[/dim]",
+            box=box.ROUNDED, border_style="cyan"
+        ))
+
+        stats_grid = Table.grid(expand=True)
+        stats_grid.add_column(ratio=1)
+        stats_grid.add_column(ratio=1)
+        stats_grid.add_row(
+            Panel(config_info, title="[cyan]Configuration[/cyan]", border_style="cyan"),
+            Panel(budget_info, title="[yellow]Budgets[/yellow]", border_style="yellow"),
+        )
+        layout["stats"].update(stats_grid)
+        layout["activity"].update(Panel(activity_table, title="[magenta]Recent Requests[/magenta]", border_style="magenta"))
+        layout["footer"].update(Panel(footer_text, border_style="white"))
+
+    # ── Non-TTY / Test Mode ──
+    if not is_tty:
+        watch = getattr(args, "watch", False)
+        if watch:
+            try:
+                while True:
+                    ly = make_layout()
+                    update_layout(ly)
+                    console.print(ly)
+                    time.sleep(2)
+                    state.last_config = get_remote_config()
+            except KeyboardInterrupt:
+                return 130
+        else:
+            ly = make_layout()
+            update_layout(ly)
+            console.print(ly)
+            return 0
+
+    # ── Interactive TTY Mode ──
+    it = Thread(target=input_thread_func, daemon=True)
+    it.start()
+
+    layout = make_layout()
+    update_layout(layout)
+
+    try:
+        with Live(layout, console=console, screen=True, refresh_per_second=1) as live:
+            while not stop_event.is_set():
+                now = time.time()
+
+                if now - state.last_refresh > 3:
+                    state.last_config = get_remote_config()
+                    state.last_refresh = now
+                    state.needs_update = True
+
+                if state.message and now > state.message_expiry:
+                    state.message = ""
+                    state.needs_update = True
+
+                # Process Input
+                try:
+                    choice = input_queue.get_nowait()
+                    state.needs_update = True
+                    ch = choice.lower() if state.menu != "budget_input" else choice
+
+                    if state.menu == "main":
+                        if ch == 'q' or ch == '\x03':
+                            stop_event.set()
+                        elif ch == 'p':
+                            state.menu = "provider"
+                        elif ch == 'b':
+                            state.menu = "budget"
+                        elif ch == 'l':
+                            state.menu = "model_role"
+                        elif ch == 'm':
+                            cur = (state.last_config.get("budget_mode") if state.last_config else settings.budget_mode)
+                            new_mode = "hard-stop" if cur == "warn" else "warn"
+                            if patch_remote_config({"budget_mode": new_mode}):
+                                state.last_config = get_remote_config()
+                                state.message = f"[green]Mode → {new_mode}[/green]"
+                                state.message_expiry = now + 2
+
+                    elif state.menu == "model_role":
+                        role_map = {"1": "default", "2": "worker", "3": "reviewer"}
+                        if ch in role_map:
+                            state.model_menu_role = role_map[ch]
+                            # Start fetching
+                            remote = state.last_config or {}
+                            cp = remote.get("provider") or settings.provider
+                            state.model_menu_provider = cp
+                            state.message = f"[dim]Fetching models for {cp}...[/dim]"
+                            state.message_expiry = now + 10
+                            state.needs_update = True
+
+                            def fetch_models(pname):
+                                res = check_remote_provider(pname)
+                                state.available_models[pname] = res.get("models", [])
+                                state.provider_health[pname] = res
+                                state.model_menu_options = res.get("models", [])
+                                state.menu = "model"
+                                state.message = ""
+                                state.needs_update = True
+
+                            Thread(target=fetch_models, args=(cp,), daemon=True).start()
+                        else:
+                            state.menu = "main"
+
+                    elif state.menu == "provider":
+                        p_map = {"1": "deepseek", "2": "groq", "3": "ollama"}
+                        if ch in p_map:
+                            new_p = p_map[ch]
+                            if patch_remote_config({"provider": new_p}):
+                                state.last_config = get_remote_config()
+                                state.message = f"[green]Provider → {new_p}[/green] [dim](checking health...)[/dim]"
+                                state.message_expiry = now + 5
+
+                                def check_new_p(pname):
+                                    res = check_remote_provider(pname)
+                                    state.provider_health[pname] = res
+                                    if res.get("available"):
+                                        state.message = f"[green]Provider → {pname} (Online)[/green]"
+                                    else:
+                                        err = res.get("error", "offline")
+                                        state.message = f"[red]Provider → {pname} (Error: {err})[/red]"
+                                    state.message_expiry = now + 3
+                                    state.needs_update = True
+
+                                Thread(target=check_new_p, args=(new_p,), daemon=True).start()
+                        state.menu = "main"
+
+                    elif state.menu == "model":
+                        if ch.isdigit() and 1 <= int(ch) <= len(state.model_menu_options):
+                            new_model = state.model_menu_options[int(ch) - 1]
+                            pname = state.model_menu_provider
+                            if apply_model_assignment(pname, new_model, state.model_menu_role):
+                                state.last_config = get_remote_config()
+                                state.message = f"[green]{state.model_menu_role} model → {new_model}[/green]"
+                                state.message_expiry = now + 2
+                            state.menu = "main"
+                        elif ch == 'm':
+                            state.menu = "model_input"
+                            state.model_input = ""
+                        else:
+                            state.menu = "main"
+
+                    elif state.menu == "model_input":
+                        if choice == '\x7f' or choice == '\x08':  # backspace
+                            state.model_input = state.model_input[:-1]
+                        elif choice == '\r' or choice == '\n':  # enter
+                            if state.model_input:
+                                pname = state.model_menu_provider
+                                new_model = state.model_input
+                                if apply_model_assignment(pname, new_model, state.model_menu_role):
+                                    state.last_config = get_remote_config()
+                                    state.message = f"[green]{state.model_menu_role} model → {new_model}[/green]"
+                                    state.message_expiry = now + 2
+                            state.menu = "main"
+                        elif choice == '\x1b':  # escape
+                            state.menu = "model"
+                        elif len(choice) == 1 and ord(choice) >= 32:
+                            state.model_input += choice
+
+                    elif state.menu == "budget":
+                        if ch == '0' or ch == '\x1b':
+                            state.menu = "main"
+                        else:
+                            for key, label, api_key, ftype in BUDGET_FIELDS:
+                                if ch == key:
+                                    state.menu = "budget_input"
+                                    state.budget_field = label
+                                    state.budget_field_key = api_key
+                                    state.budget_input = ""
+                                    break
+                            else:
+                                state.menu = "main"
+
+                    elif state.menu == "budget_input":
+                        if choice in '0123456789.':
+                            state.budget_input += choice
+                        elif choice == '\x7f' or choice == '\x08':  # backspace
+                            state.budget_input = state.budget_input[:-1]
+                        elif choice == '\r' or choice == '\n':  # enter
+                            if state.budget_input:
+                                try:
+                                    # Determine type from field definition
+                                    ftype = "float"
+                                    for _, _, ak, ft in BUDGET_FIELDS:
+                                        if ak == state.budget_field_key:
+                                            ftype = ft
+                                            break
+                                    val = float(state.budget_input) if ftype == "float" else int(state.budget_input)
+                                    if patch_remote_config({state.budget_field_key: val}):
+                                        state.last_config = get_remote_config()
+                                        state.message = f"[green]{state.budget_field} → {val}[/green]"
+                                        state.message_expiry = now + 2
+                                    else:
+                                        state.message = "[red]Failed to update (server unreachable)[/red]"
+                                        state.message_expiry = now + 2
+                                except ValueError:
+                                    state.message = "[red]Invalid number[/red]"
+                                    state.message_expiry = now + 2
+                            state.menu = "main"
+                            state.budget_field = None
+                            state.budget_input = ""
+                        elif choice == '\x1b':  # escape
+                            state.menu = "budget"
+                            state.budget_field = None
+                            state.budget_input = ""
+
+                except queue.Empty:
+                    pass
+
+                if state.needs_update:
+                    update_layout(layout)
+                    state.needs_update = False
+
+                time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        stop_event.set()
+
+    return 0
+
+
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -396,6 +1235,12 @@ def cmd_paths(args: argparse.Namespace) -> int:
             "mock_deepseek": settings.mock_deepseek,
             "allow_apply_patch": settings.allow_apply_patch,
             "trace_enabled": settings.trace_enabled,
+            "provider": settings.provider,
+            "fallback_providers": settings.fallback_providers,
+            "providers": sanitized_provider_summary(settings),
+            "audit_log_file": str(settings.audit_log_file),
+            "usage_file": str(settings.usage_file),
+            "usage_jsonl_file": str(settings.usage_jsonl_file),
         }, indent=2))
     else:
         for name, path in settings.sanitized_paths().items():
@@ -409,6 +1254,13 @@ def cmd_paths(args: argparse.Namespace) -> int:
         print(f"mock_deepseek: {settings.mock_deepseek}")
         print(f"allow_apply_patch: {settings.allow_apply_patch}")
         print(f"trace_enabled: {settings.trace_enabled}")
+        print(f"provider: {settings.provider}")
+        print(f"fallback_providers: {','.join(settings.fallback_providers) or 'none'}")
+        print(f"audit_log_file: {settings.audit_log_file}")
+        print(f"usage_file: {settings.usage_file}")
+        print(f"usage_jsonl_file: {settings.usage_jsonl_file}")
+        for name, provider in sanitized_provider_summary(settings).items():
+            print(f"provider.{name}: type={provider['type']} kind={provider['kind']} enabled={provider['enabled']}")
     return 0
 
 
@@ -425,8 +1277,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     issues: list[str] = []
 
-    if not settings.mock_deepseek and not settings.deepseek_api_key:
-        issues.append("DEEPSEEK_API_KEY is not set (use --mock or export DEEPSEEK_API_KEY)")
+    selected_provider = settings.providers.get(settings.provider)
+    if selected_provider is None:
+        issues.append(f"provider {settings.provider!r} is not configured")
+    elif not selected_provider.enabled:
+        issues.append(f"provider {settings.provider!r} is disabled")
+    elif selected_provider.kind != "local" and not selected_provider.api_key and not settings.mock_deepseek:
+        if selected_provider.provider_type == "deepseek":
+            issues.append("DEEPSEEK_API_KEY is not set (use --mock or export DEEPSEEK_API_KEY)")
+        else:
+            issues.append(f"provider {settings.provider!r} requires an API key")
+    for provider_name in settings.fallback_providers:
+        provider = settings.providers.get(provider_name)
+        if provider is None:
+            issues.append(f"fallback provider {provider_name!r} is not configured")
+        elif not provider.enabled:
+            issues.append(f"fallback provider {provider_name!r} is disabled")
 
     if settings.state_dir == Path():
         issues.append("state_dir could not be resolved")
@@ -441,7 +1307,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return 1
     print("Configuration looks good.")
     if args.json:
-        print(json.dumps({"healthy": True, "issues": issues}))
+        print(json.dumps({"healthy": True, "issues": issues, "provider": settings.provider}))
     return 0
 
 
@@ -660,17 +1526,17 @@ def _hash_content(content: str) -> str:
 
 
 def _pkg_version_str() -> str:
+    root = Path(__file__).resolve().parents[2]
+    package_json = root / "package.json"
+    if package_json.exists():
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+        package_version = data.get("version")
+        if isinstance(package_version, str):
+            return package_version
+
     try:
         return _pkg_version("subagent-router")
     except PackageNotFoundError:
-        root = Path(__file__).resolve().parents[2]
-        package_json = root / "package.json"
-        if package_json.exists():
-            data = json.loads(package_json.read_text(encoding="utf-8"))
-            package_version = data.get("version")
-            if isinstance(package_version, str):
-                return package_version
-
         pyproject = root / "pyproject.toml"
         if pyproject.exists():
             data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
@@ -866,6 +1732,26 @@ def can_create_dir(path: Path) -> bool:
         return False
 
 
+def sanitized_provider_summary(settings: Settings) -> dict[str, dict[str, object]]:
+    return {
+        name: {
+            "type": provider.provider_type,
+            "kind": provider.kind,
+            "enabled": provider.enabled,
+            "base_url_configured": bool(provider.base_url),
+            "model": provider.model,
+            "api_key_configured": bool(provider.api_key),
+            "capabilities": {
+                "context_window": provider.capabilities.context_window,
+                "tool_support": provider.capabilities.supports_tools,
+                "streaming_support": provider.capabilities.supports_streaming,
+                "cost_hint": provider.capabilities.cost_hint,
+            },
+        }
+        for name, provider in settings.providers.items()
+    }
+
+
 def systemd_unit(exec_start: str, settings: Settings) -> str:
     env_lines = "\n".join(
         f'Environment="{key}={value}"'
@@ -884,6 +1770,133 @@ Restart=on-failure
 WantedBy=default.target
 """
 
+
+
+def cmd_validate_artifacts(args: argparse.Namespace) -> int:
+    """Validate release artifacts for packaging consistency."""
+    issues: list[str] = []
+    warnings: list[str] = []
+    checks: dict[str, bool | str] = {}
+
+    # Version consistency
+    root = Path(__file__).resolve().parents[2]
+    source_tree = (root / ".git").exists() or (root / "tests").exists()
+    pkg_json_path = root / "package.json"
+    pyproject_path = root / "pyproject.toml"
+    pkg_version: str | None = None
+    py_version: str | None = None
+
+    if pkg_json_path.exists():
+        try:
+            pkg = json.loads(pkg_json_path.read_text(encoding="utf-8"))
+            pkg_version = pkg.get("version")
+            checks["package_json_exists"] = True
+        except (OSError, json.JSONDecodeError):
+            issues.append("package.json exists but is not valid JSON")
+            checks["package_json_exists"] = False
+    else:
+        issues.append("package.json not found")
+        checks["package_json_exists"] = False
+
+    if pyproject_path.exists():
+        try:
+            py_data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+            py_version = (py_data.get("project") or {}).get("version")
+            checks["pyproject_toml_exists"] = True
+        except (OSError, tomllib.TOMLDecodeError):
+            issues.append("pyproject.toml exists but is not valid TOML")
+            checks["pyproject_toml_exists"] = False
+    else:
+        if source_tree:
+            issues.append("pyproject.toml not found")
+        else:
+            warnings.append(
+                "pyproject.toml not found; this is expected for installed npm artifacts. "
+                "Run validate-artifacts from the source tree for release validation."
+            )
+        checks["pyproject_toml_exists"] = False
+
+    if pkg_version and py_version:
+        if pkg_version == py_version:
+            checks["version_consistency"] = True
+        else:
+            issues.append(f"version mismatch: package.json={pkg_version!r}, pyproject.toml={py_version!r}")
+            checks["version_consistency"] = False
+    elif pkg_version or py_version:
+        checks["version_consistency"] = pkg_version or py_version
+    else:
+        checks["version_consistency"] = False
+
+    # Check key source files exist
+    src_dir = Path(__file__).resolve().parent
+    app_py = src_dir / "app.py"
+    settings_py = src_dir / "settings.py"
+    checks["app_py_exists"] = app_py.exists()
+    checks["settings_py_exists"] = settings_py.exists()
+    if not app_py.exists():
+        issues.append(f"app.py not found at {app_py}")
+    if not settings_py.exists():
+        issues.append(f"settings.py not found at {settings_py}")
+
+    # Check CLI is importable
+    try:
+        from subagent_router import cli as _test_cli
+        checks["cli_importable"] = True
+    except Exception as exc:
+        checks["cli_importable"] = False
+        issues.append(f"cli module cannot be imported: {exc}")
+
+    # Check npm packaging structure
+    bin_dir = root / "bin"
+    npm_bin = bin_dir / "subagent-router.js"
+    checks["npm_bin_exists"] = npm_bin.exists()
+    if not npm_bin.exists():
+        issues.append(f"npm bin script not found at {npm_bin}")
+
+    # Check docs directory
+    docs_dir = root / "docs"
+    required_docs = ["usage.md", "compatibility.md", "test_matrix.md", "ROADMAP.md", "troubleshooting.md"]
+    for doc in required_docs:
+        key = f"doc_{doc.replace('.', '_')}_exists"
+        checks[key] = (docs_dir / doc).exists()
+
+    # Check README
+    checks["readme_exists"] = (root / "README.md").exists()
+    checks["changelog_exists"] = (root / "CHANGELOG.md").exists()
+
+    if args.json:
+        print(json.dumps({
+            "healthy": len(issues) == 0,
+            "issues": issues,
+            "warnings": warnings,
+            "checks": {k: v for k, v in checks.items()},
+            "package_version": pkg_version,
+            "pyproject_version": py_version,
+        }, indent=2, sort_keys=True))
+    else:
+        print(f"subagent-router validate-artifacts")
+        print(f"  package.json version: {pkg_version or '(missing)'}")
+        print(f"  pyproject.toml version: {py_version or '(missing)'}")
+        version_ok = checks.get("version_consistency")
+        print(f"  version consistency: {'OK' if version_ok is True else version_ok if isinstance(version_ok, str) else 'MISMATCH'}")
+        print(f"  app.py: {'OK' if checks.get('app_py_exists') else 'MISSING'}")
+        print(f"  settings.py: {'OK' if checks.get('settings_py_exists') else 'MISSING'}")
+        print(f"  npm bin: {'OK' if checks.get('npm_bin_exists') else 'MISSING'}")
+        print(f"  CLI importable: {'OK' if checks.get('cli_importable') else 'FAIL'}")
+        print(f"  docs: {sum(1 for k, v in checks.items() if k.startswith('doc_') and v)}/{len(required_docs)} present")
+        print(f"  README: {'OK' if checks.get('readme_exists') else 'MISSING'}")
+        print(f"  CHANGELOG: {'OK' if checks.get('changelog_exists') else 'MISSING'}")
+        if warnings:
+            print(f"  warnings ({len(warnings)}):")
+            for warning in warnings:
+                print(f"    - {warning}")
+        if issues:
+            print(f"  issues ({len(issues)}):")
+            for issue in issues:
+                print(f"    - {issue}")
+            return 1
+        print("  All checks passed.")
+    return 0
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
