@@ -205,6 +205,7 @@ def normalize_input_items(
     messages: list[dict[str, Any]] = []
     pending_call_ids = set(initial_pending_call_ids or {})
     queued_tool_calls: list[dict[str, Any]] = []
+    delayed_pending_messages: list[dict[str, Any]] = []
 
     def flush_queued_tool_calls() -> None:
         if not queued_tool_calls:
@@ -217,15 +218,24 @@ def normalize_input_items(
         )
         queued_tool_calls.clear()
 
+    def flush_delayed_pending_messages() -> None:
+        if pending_call_ids or not delayed_pending_messages:
+            return
+        messages.extend(delayed_pending_messages)
+        delayed_pending_messages.clear()
+
     for item in items:
         item_type = item.get("type")
         if item_type == "message":
             flush_queued_tool_calls()
+            msg = normalize_message(item)
             if pending_call_ids:
+                if msg.get("role") == "system":
+                    delayed_pending_messages.append(msg)
+                    continue
                 raise PayloadNormalizationError(
                     f"message after pending tool calls without matching tool output: {pending_call_ids}"
                 )
-            msg = normalize_message(item)
             if reasoning_content_by_assistant_text and msg.get("role") == "assistant":
                 text = msg.get("content")
                 if text and text in reasoning_content_by_assistant_text:
@@ -260,13 +270,16 @@ def normalize_input_items(
             flush_queued_tool_calls()
             tool_output = normalize_tool_output(item, pending_call_ids)
             messages.append(tool_output)
+            flush_delayed_pending_messages()
         elif item_type == "tool_search_output":
             flush_queued_tool_calls()
             messages.append(normalize_tool_output(item, pending_call_ids))
+            flush_delayed_pending_messages()
         else:
             raise PayloadNormalizationError(f"unsupported input item type: {item_type!r}")
 
     flush_queued_tool_calls()
+    flush_delayed_pending_messages()
     return messages
 
 

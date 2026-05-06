@@ -161,6 +161,7 @@ def _capabilities(raw: Mapping[str, Any] | None, *, kind: str, provider_type: st
         cost_hint=str(data.get("cost_hint") or ("zero-api-cost" if kind == "local" else "unknown")),
         input_cost_per_million=_float_value(data.get("input_cost_per_million")),
         output_cost_per_million=_float_value(data.get("output_cost_per_million")),
+        cached_input_cost_per_million=_float_value(data.get("cached_input_cost_per_million")),
         supports_reasoning=_bool_value(data.get("reasoning_support"), False),
         supports_token_accounting=_bool_value(data.get("token_accounting_support"), True),
         supports_usage_reporting=_bool_value(data.get("usage_reporting_support"), True),
@@ -223,6 +224,7 @@ def _provider_configs(source: Mapping[str, str], file_config: dict[str, Any]) ->
             cost_hint=deepseek_capabilities.cost_hint if deepseek_capabilities.cost_hint != "unknown" else "paid-api",
             input_cost_per_million=deepseek_capabilities.input_cost_per_million,
             output_cost_per_million=deepseek_capabilities.output_cost_per_million,
+            cached_input_cost_per_million=deepseek_capabilities.cached_input_cost_per_million,
             supports_reasoning=True,
             supports_token_accounting=deepseek_capabilities.supports_token_accounting,
             supports_usage_reporting=deepseek_capabilities.supports_usage_reporting,
@@ -507,8 +509,38 @@ class Settings:
                     new_providers = dict(settings.providers)
                     for pname, pdata in overrides["providers"].items():
                         if pname in new_providers:
+                            cap = new_providers[pname].capabilities
+                            if "pricing" in pdata:
+                                pricing = pdata["pricing"]
+                                cap = replace(
+                                    cap,
+                                    input_cost_per_million=pricing.get("in", cap.input_cost_per_million),
+                                    output_cost_per_million=pricing.get("out", cap.output_cost_per_million),
+                                    cached_input_cost_per_million=pricing.get("cached", cap.cached_input_cost_per_million),
+                                    cost_hint="configured-api" if any(k in pricing for k in ("in", "out", "cached")) else cap.cost_hint
+                                )
+                            
+                            mp_kwargs = {}
+                            if "model_pricing" in pdata and isinstance(pdata["model_pricing"], dict):
+                                mp_model_pricing = {}
+                                for mname, mrates in pdata["model_pricing"].items():
+                                    if isinstance(mrates, dict):
+                                        mp_model_pricing[mname] = {
+                                            "input_cost_per_million": mrates.get("in"),
+                                            "output_cost_per_million": mrates.get("out"),
+                                            "cached_input_cost_per_million": mrates.get("cached"),
+                                        }
+                                mp_kwargs["model_pricing"] = mp_model_pricing
                             if "model" in pdata:
-                                new_providers[pname] = replace(new_providers[pname], model=pdata["model"])
+                                new_providers[pname] = replace(new_providers[pname], model=pdata["model"], capabilities=cap, **mp_kwargs)
+                            else:
+                                new_providers[pname] = replace(new_providers[pname], capabilities=cap, **mp_kwargs)
+                                
+                            if "worker_model" in pdata:
+                                new_providers[pname] = replace(new_providers[pname], worker_model=pdata["worker_model"])
+                            if "reviewer_model" in pdata:
+                                new_providers[pname] = replace(new_providers[pname], reviewer_model=pdata["reviewer_model"])
+
                             if "enabled" in pdata:
                                 new_providers[pname] = replace(new_providers[pname], enabled=bool(pdata["enabled"]))
                     updates["providers"] = new_providers
@@ -537,6 +569,34 @@ class Settings:
             return self
         return replace(self, providers=new_providers)
 
+    @staticmethod
+    def _provider_entry(p: ProviderConfig) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "model": p.model,
+            "enabled": p.enabled,
+            "pricing": {
+                k: v for k, v in {
+                    "in": p.capabilities.input_cost_per_million,
+                    "out": p.capabilities.output_cost_per_million,
+                    "cached": p.capabilities.cached_input_cost_per_million,
+                }.items() if v is not None
+            },
+            "model_pricing": {
+                mname: {
+                    mk: mv for mk, mv in {
+                        "in": rates.get("input_cost_per_million"),
+                        "out": rates.get("output_cost_per_million"),
+                        "cached": rates.get("cached_input_cost_per_million"),
+                    }.items() if mv is not None
+                } for mname, rates in p.model_pricing.items()
+            },
+        }
+        if p.worker_model is not None:
+            entry["worker_model"] = p.worker_model
+        if p.reviewer_model is not None:
+            entry["reviewer_model"] = p.reviewer_model
+        return entry
+
     def save_runtime_config(self) -> None:
         import json
         path = self.state_dir / "runtime_config.json"
@@ -548,7 +608,9 @@ class Settings:
             "max_cost_per_session": self.max_cost_per_session,
             "max_cost_per_task": self.max_cost_per_task,
             "routing_policies": self.routing_policies,
-            "providers": {name: {"model": p.model, "enabled": p.enabled} for name, p in self.providers.items()},
+            "providers": {
+                name: self._provider_entry(p) for name, p in self.providers.items()
+            },
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")

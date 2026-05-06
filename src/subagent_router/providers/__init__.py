@@ -15,6 +15,7 @@ class ProviderCapabilities:
     cost_hint: str = "unknown"
     input_cost_per_million: float | None = None
     output_cost_per_million: float | None = None
+    cached_input_cost_per_million: float | None = None
     supports_reasoning: bool = False
     supports_token_accounting: bool = True
     supports_usage_reporting: bool = True
@@ -36,6 +37,9 @@ class ProviderConfig:
     enabled: bool = True
     timeout_seconds: float | None = None
     send_parallel_tool_calls: bool = False
+    model_pricing: dict[str, dict[str, float | None]] = field(default_factory=dict)
+    worker_model: str | None = None
+    reviewer_model: str | None = None
 
 
 @dataclass(frozen=True)

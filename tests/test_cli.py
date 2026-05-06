@@ -447,7 +447,10 @@ class CliTests(unittest.TestCase):
                 "daily_usage": {
                     datetime.date.today().isoformat(): {
                         "total_cost_usd": 0.025,
-                        "total_tokens": 1200
+                        "total_tokens": 1200,
+                        "input_tokens": 900,
+                        "cached_input_tokens": 300,
+                        "output_tokens": 300,
                     }
                 }
             }
@@ -472,8 +475,90 @@ class CliTests(unittest.TestCase):
         self.assertIn("Configuration", output)
         self.assertIn("Budgets", output)
         self.assertIn("Daily $", output)
+        self.assertIn("900 / 300 / 300", output)
         self.assertIn("Recent Requests", output)
         self.assertIn("deepseek", output)
+
+    def test_tui_shows_error_details_for_failed_requests(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            logs_dir = Path(state_dir) / "logs"
+            logs_dir.mkdir(parents=True)
+            (logs_dir / "usage.json").write_text(
+                json.dumps({"daily_usage": {datetime.date.today().isoformat(): {}}}),
+                encoding="utf-8",
+            )
+            audit_path = logs_dir / "audit.jsonl"
+            audit_path.write_text(
+                json.dumps(
+                    {
+                        "timestamp": time.time(),
+                        "status": "error",
+                        "provider": "deepseek",
+                        "model": "deepseek-v4-flash",
+                        "status_code": 502,
+                        "message": "provider transport error: read timeout",
+                        "estimated_cost_usd": 0.0,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                result = cli.main(["tui", "--state-dir", state_dir])
+
+        self.assertEqual(result, 0)
+        output = stream.getvalue()
+        self.assertIn("ERR", output)
+        self.assertIn("read timeout", output)
+
+    def test_tui_does_not_mark_recovery_audit_records_as_errors(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            logs_dir = Path(state_dir) / "logs"
+            logs_dir.mkdir(parents=True)
+            (logs_dir / "usage.json").write_text(
+                json.dumps({"daily_usage": {datetime.date.today().isoformat(): {}}}),
+                encoding="utf-8",
+            )
+            audit_path = logs_dir / "audit.jsonl"
+            audit_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": time.time(),
+                                "status": "incomplete-output-retry",
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "reason": "provider returned empty output: no assistant message or tool call",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": time.time(),
+                                "status": "synthetic-continuation",
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "reason": "provider returned empty output: no assistant message or tool call",
+                                "tool": "exec_command",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                result = cli.main(["tui", "--state-dir", state_dir])
+
+        self.assertEqual(result, 0)
+        output = stream.getvalue()
+        self.assertIn("RETRY", output)
+        self.assertIn("CONT", output)
+        self.assertNotIn("ERR", output)
 
     def test_validate_artifacts_passes(self):
         result = cli.main(["validate-artifacts"])

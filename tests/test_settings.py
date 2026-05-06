@@ -1,6 +1,8 @@
+import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -299,6 +301,39 @@ max_tokens_per_session = 200000
         self.assertIsNone(settings.max_tokens_per_day)
         self.assertIsNone(settings.max_cost_per_session)
         self.assertIsNone(settings.max_tokens_per_session)
+
+    def test_save_runtime_config_filters_null_pricing_values(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            settings = Settings.from_env({"SUBAGENT_ROUTER_STATE_DIR": state_dir})
+            provider = settings.providers["deepseek"]
+            settings = replace(
+                settings,
+                providers={
+                    **settings.providers,
+                    "deepseek": replace(
+                        provider,
+                        model_pricing={
+                            "custom-model": {
+                                "input_cost_per_million": 0.0,
+                                "output_cost_per_million": None,
+                                "cached_input_cost_per_million": 0.01,
+                            }
+                        },
+                        worker_model=None,
+                        reviewer_model="deepseek-v4-pro",
+                    ),
+                },
+            )
+
+            settings.save_runtime_config()
+
+            data = json.loads((Path(state_dir) / "runtime_config.json").read_text(encoding="utf-8"))
+            deepseek = data["providers"]["deepseek"]
+            self.assertNotIn("worker_model", deepseek)
+            self.assertEqual(deepseek["reviewer_model"], "deepseek-v4-pro")
+            self.assertNotIn("out", deepseek["model_pricing"]["custom-model"])
+            self.assertEqual(deepseek["model_pricing"]["custom-model"]["in"], 0.0)
+            self.assertEqual(deepseek["model_pricing"]["custom-model"]["cached"], 0.01)
 
 
     # ---------- ProviderPrediction tests ----------

@@ -21,6 +21,7 @@ except ImportError as exc:  # pragma: no cover - exercised by runtime startup.
     ) from exc
 
 from .normalization import (
+    MODEL_ALIASES,
     NormalizedRequest,
     PayloadNormalizationError,
     ToolNameMapping,
@@ -46,30 +47,37 @@ REASONING_CONTENT_BY_ASSISTANT_TEXT: dict[str, str] = {}
 MAX_RESPONSE_STATES = 100
 USAGE_LOCK = threading.Lock()
 SESSION_EVENTS: list[dict[str, Any]] = []
-ACTIVITY_STATE: dict[str, Any] = {
-    "started_at": None,
-    "last_request_at": None,
-    "last_response_at": None,
-    "last_error_at": None,
-    "request_count": 0,
-    "response_count": 0,
-    "error_count": 0,
-    "last_trace_id": None,
-    "last_model": None,
-    "last_provider": None,
-    "last_output_kind": None,
-    "last_end_turn": None,
-    "requests_by_provider": {},
-    "requests_by_model": {},
-    "errors_by_provider": {},
-    "local_request_count": 0,
-    "cloud_request_count": 0,
-    "fallback_count": 0,
-    "total_latency_ms": 0,
-    "average_latency_ms": 0,
-    "total_cost_usd": 0.0,
-    "total_tokens": 0,
-}
+LAST_FINAL_SESSION_EVENT: dict[str, Any] | None = None
+
+
+def default_activity_state() -> dict[str, Any]:
+    return {
+        "started_at": None,
+        "last_request_at": None,
+        "last_response_at": None,
+        "last_error_at": None,
+        "request_count": 0,
+        "response_count": 0,
+        "error_count": 0,
+        "last_trace_id": None,
+        "last_model": None,
+        "last_provider": None,
+        "last_output_kind": None,
+        "last_end_turn": None,
+        "requests_by_provider": {},
+        "requests_by_model": {},
+        "errors_by_provider": {},
+        "local_request_count": 0,
+        "cloud_request_count": 0,
+        "fallback_count": 0,
+        "total_latency_ms": 0,
+        "average_latency_ms": 0,
+        "total_cost_usd": 0.0,
+        "total_tokens": 0,
+    }
+
+
+ACTIVITY_STATE: dict[str, Any] = default_activity_state()
 
 
 @app.post("/v1/chat/completions", response_model=None)
@@ -103,6 +111,7 @@ async def create_response(request: Request) -> JSONResponse | StreamingResponse:
             for msg in payload["messages"]
         ]
 
+    route = select_route(request, payload)
     try:
         normalized = normalize_request(
             payload,
@@ -112,11 +121,12 @@ async def create_response(request: Request) -> JSONResponse | StreamingResponse:
             allow_apply_patch_enabled=SETTINGS.apply_patch_override(),
         )
     except PayloadNormalizationError as exc:
-        record_activity("error", trace_id=trace_id)
+        requested_model = requested_model_from_payload(payload)
+        record_activity("error", trace_id=trace_id, model=requested_model, provider=route.provider)
+        write_failed_attempt_audit(trace_id, route, str(exc), 400, model=requested_model)
         trace_line(trace_id, f"normalize_error status=400 message={preview_text(str(exc))}")
         return error_response(str(exc), status_code=400)
 
-    route = select_route(request, payload)
     record_activity("request", trace_id=trace_id, model=normalized.requested_model, provider=route.provider)
     trace_request(trace_id, normalized)
 
@@ -313,6 +323,8 @@ def record_activity(
     end_turn: bool | None = None,
 ) -> None:
     now = int(time.time())
+    for key, value in default_activity_state().items():
+        ACTIVITY_STATE.setdefault(key, value)
     if ACTIVITY_STATE["started_at"] is None:
         ACTIVITY_STATE["started_at"] = now
     if kind == "request":
@@ -371,8 +383,11 @@ def record_session_response(
     normalized: NormalizedRequest,
     response: dict[str, Any],
 ) -> None:
+    global LAST_FINAL_SESSION_EVENT
     event = session_event_from_response(trace_id, normalized, response)
     SESSION_EVENTS.append(event)
+    if event.get("end_turn") is True:
+        LAST_FINAL_SESSION_EVENT = event
     if len(SESSION_EVENTS) > MAX_SESSION_EVENTS:
         del SESSION_EVENTS[:-MAX_SESSION_EVENTS]
     write_session_mirror()
@@ -397,7 +412,7 @@ def session_mirror_snapshot() -> dict[str, Any]:
             for event in reversed(SESSION_EVENTS)
             if event.get("end_turn") is True
         ),
-        None,
+        LAST_FINAL_SESSION_EVENT,
     )
     return {
         "now": int(time.time()),
@@ -456,19 +471,20 @@ def message_text(item: dict[str, Any]) -> str:
 
 def activity_snapshot() -> dict[str, Any]:
     now = int(time.time())
+    state = {**default_activity_state(), **ACTIVITY_STATE}
     last_seen_at = max(
         timestamp
         for timestamp in (
-            ACTIVITY_STATE["last_request_at"],
-            ACTIVITY_STATE["last_response_at"],
-            ACTIVITY_STATE["last_error_at"],
+            state["last_request_at"],
+            state["last_response_at"],
+            state["last_error_at"],
             0,
         )
         if isinstance(timestamp, int)
     )
     seconds_since_last_activity = now - last_seen_at if last_seen_at else None
     return {
-        **ACTIVITY_STATE,
+        **state,
         "now": now,
         "last_activity_at": last_seen_at or None,
         "seconds_since_last_activity": seconds_since_last_activity,
@@ -527,6 +543,13 @@ def select_route(request: Request, payload: dict[str, Any]) -> RouteSelection:
         else:
             fallback_providers = [str(item) for item in fallback]
         model = str(policy["model"]) if policy.get("model") else None
+        if not model:
+            p_cfg = SETTINGS.providers.get(provider)
+            if p_cfg:
+                if policy_name == "safe-default" and p_cfg.worker_model:
+                    model = p_cfg.worker_model
+                elif policy_name == "cheap-review" and p_cfg.reviewer_model:
+                    model = p_cfg.reviewer_model
         provider, fallback_providers, reason = optimize_provider_order(
             provider,
             fallback_providers,
@@ -678,7 +701,7 @@ async def call_provider(normalized: NormalizedRequest, route: RouteSelection) ->
         if provider_name in SETTINGS.denied_providers:
             route.attempts.append({"provider": provider_name, "status": "blocked", "error": "denylisted"})
             raise ProviderConfigurationError(f"provider {provider_name!r} is denied by configuration")
-        selected_model = route.model or config.model or normalized.model
+        selected_model = route.model or default_model_for_request(config, normalized)
         try:
             provider = build_provider(config)
             if budget_hard_stop_for_request(normalized, config, selected_model):
@@ -686,7 +709,7 @@ async def call_provider(normalized: NormalizedRequest, route: RouteSelection) ->
                 raise BudgetExceededError("budget exceeded before provider request")
             if index > 0:
                 ACTIVITY_STATE["fallback_count"] = int(ACTIVITY_STATE.get("fallback_count", 0)) + 1
-            result = await provider.chat(normalized, model=route.model)
+            result = await provider.chat(normalized, model=selected_model)
             route.attempts.append({
                 "provider": result.provider, "model": result.model, "status": "ok",
                 "latency_ms": result.latency_ms,
@@ -737,6 +760,12 @@ def build_provider(config: ProviderConfig) -> Provider:
     return OpenAICompatibleProvider(config)
 
 
+def default_model_for_request(config: ProviderConfig, normalized: NormalizedRequest) -> str:
+    if is_subagent_model(normalized.requested_model) or is_subagent_model(normalized.model):
+        return normalized.model
+    return config.model or normalized.model
+
+
 def dry_run_provider_response(normalized: NormalizedRequest, route: RouteSelection) -> ProviderResponse:
     provider = route.provider
     config = SETTINGS.providers.get(provider)
@@ -763,19 +792,40 @@ def estimate_cost_usd(usage: dict[str, Any], config: ProviderConfig | None, mode
         return 0.0
     input_tokens = int(usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("output_tokens") or 0)
-    input_rate = config.capabilities.input_cost_per_million
-    output_rate = config.capabilities.output_cost_per_million
+    cached_tokens = min(input_tokens, int((usage.get("input_tokens_details") or {}).get("cached_tokens") or 0))
+
+    # Non-cached input tokens
+    miss_tokens = max(0, input_tokens - cached_tokens)
+
+    model_rates = config.model_pricing.get(model, {})
+    input_val = model_rates.get("input_cost_per_million")
+    input_rate = input_val if input_val is not None else config.capabilities.input_cost_per_million
+    output_val = model_rates.get("output_cost_per_million")
+    output_rate = output_val if output_val is not None else config.capabilities.output_cost_per_million
+    cached_val = model_rates.get("cached_input_cost_per_million")
+    cached_rate = cached_val if cached_val is not None else config.capabilities.cached_input_cost_per_million
+
     if input_rate is None and output_rate is None:
-        input_rate, output_rate = default_price_per_million(config.name, model)
-    return round(((input_tokens * (input_rate or 0.0)) + (output_tokens * (output_rate or 0.0))) / 1_000_000, 8)
+        input_rate, output_rate, default_cached = default_price_per_million(config.name, model)
+        if cached_rate is None:
+            cached_rate = default_cached
+
+    # If no explicit cached rate, fallback to full input rate
+    cached_rate = cached_rate if cached_rate is not None else input_rate
+
+    cost = (miss_tokens * (input_rate or 0.0)) + (cached_tokens * (cached_rate or 0.0)) + (output_tokens * (output_rate or 0.0))
+    return round(cost / 1_000_000, 8)
 
 
-def default_price_per_million(provider: str, model: str) -> tuple[float | None, float | None]:
+def default_price_per_million(provider: str, model: str) -> tuple[float | None, float | None, float | None]:
+    """Default per-million-token pricing.  Updated 2026-05-05 from api.deepseek.com."""
     if provider == "deepseek":
         if "pro" in model or "reasoner" in model:
-            return 0.55, 2.19
-        return 0.27, 1.10
-    return None, None
+            # DeepSeek V4 Pro (75% launch promo): $0.435 in / $0.87 out / $0.003625 cache hit
+            return 0.435, 0.87, 0.003625
+        # DeepSeek V4 Flash: $0.14 in (cache miss) / $0.28 out / $0.0028 cache hit
+        return 0.14, 0.28, 0.0028
+    return None, None, None
 
 
 def budget_hard_stop_for_request(normalized: NormalizedRequest, config: ProviderConfig, model: str) -> bool:
@@ -979,7 +1029,14 @@ def write_audit_record(record: dict[str, Any]) -> None:
         pass
 
 
-def write_failed_attempt_audit(trace_id: str, route: RouteSelection, message: str, status_code: int) -> None:
+def write_failed_attempt_audit(
+    trace_id: str,
+    route: RouteSelection,
+    message: str,
+    status_code: int,
+    *,
+    model: str | None = None,
+) -> None:
     """Write an audit record with enriched fallback chain diagnostics."""
     chain_diagnostics = []
     for attempt in route.attempts:
@@ -1004,6 +1061,7 @@ def write_failed_attempt_audit(trace_id: str, route: RouteSelection, message: st
             "trace_id": trace_id,
             "status": "error",
             "provider": route.provider,
+            "model": model or route.model,
             "routing_policy": route.policy,
             "selection_reason": route.reason,
             "status_code": status_code,
@@ -1021,17 +1079,26 @@ def write_failed_attempt_audit(trace_id: str, route: RouteSelection, message: st
     )
 
 
+def requested_model_from_payload(payload: dict[str, Any]) -> str | None:
+    model = payload.get("model")
+    return str(model) if model is not None else None
+
+
 def write_usage_record(record: dict[str, Any]) -> None:
     with USAGE_LOCK:
         try:
             SETTINGS.usage_file.parent.mkdir(parents=True, exist_ok=True)
             current = read_usage_summary()
+            token_counts = usage_token_counts(record.get("usage", {}))
             records = current.setdefault("records", [])
             if isinstance(records, list):
                 records.append(record)
                 del records[:-200]
             current["request_count"] = int(current.get("request_count", 0)) + 1
-            current["total_tokens"] = int(current.get("total_tokens", 0)) + int(record.get("usage", {}).get("total_tokens") or 0)
+            current["total_tokens"] = int(current.get("total_tokens", 0)) + token_counts["total_tokens"]
+            current["total_input_tokens"] = int(current.get("total_input_tokens", 0)) + token_counts["input_tokens"]
+            current["total_cached_input_tokens"] = int(current.get("total_cached_input_tokens", 0)) + token_counts["cached_tokens"]
+            current["total_output_tokens"] = int(current.get("total_output_tokens", 0)) + token_counts["output_tokens"]
             current["total_cost_usd"] = round(float(current.get("total_cost_usd", 0.0)) + float(record.get("estimated_cost_usd") or 0.0), 8)
             by_provider = current.setdefault("requests_by_provider", {})
             provider = str(record.get("provider") or "unknown")
@@ -1044,7 +1111,10 @@ def write_usage_record(record: dict[str, Any]) -> None:
             daily_usage = current.setdefault("daily_usage", {})
             day = daily_usage.setdefault(today, {"total_cost_usd": 0.0, "total_tokens": 0, "request_count": 0})
             day["total_cost_usd"] = round(float(day.get("total_cost_usd", 0.0)) + float(record.get("estimated_cost_usd") or 0.0), 8)
-            day["total_tokens"] = int(day.get("total_tokens", 0)) + int(record.get("usage", {}).get("total_tokens") or 0)
+            day["total_tokens"] = int(day.get("total_tokens", 0)) + token_counts["total_tokens"]
+            day["input_tokens"] = int(day.get("input_tokens", 0)) + token_counts["input_tokens"]
+            day["cached_input_tokens"] = int(day.get("cached_input_tokens", 0)) + token_counts["cached_tokens"]
+            day["output_tokens"] = int(day.get("output_tokens", 0)) + token_counts["output_tokens"]
             day["request_count"] = int(day.get("request_count", 0)) + 1
             tmp_path = SETTINGS.usage_file.with_suffix(SETTINGS.usage_file.suffix + ".tmp")
             tmp_path.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
@@ -1054,6 +1124,17 @@ def write_usage_record(record: dict[str, Any]) -> None:
                 handle.write(json.dumps(sanitize_diagnostic(record), sort_keys=True) + "\n")
         except OSError:
             pass
+
+
+def usage_token_counts(usage: Any) -> dict[str, int]:
+    normalized = normalize_usage(usage)
+    details = normalized.get("input_tokens_details") or {}
+    return {
+        "input_tokens": int(normalized.get("input_tokens") or 0),
+        "cached_tokens": int(details.get("cached_tokens") or 0),
+        "output_tokens": int(normalized.get("output_tokens") or 0),
+        "total_tokens": int(normalized.get("total_tokens") or 0),
+    }
 
 
 def read_usage_summary() -> dict[str, Any]:
@@ -1211,15 +1292,40 @@ async def get_config() -> dict[str, Any]:
     for name, cfg in SETTINGS.providers.items():
         if not cfg.enabled:
             continue
-        inp = cfg.capabilities.input_cost_per_million
-        out = cfg.capabilities.output_cost_per_million
+        
+        # Check model-specific pricing for the current model
+        active_model = cfg.model or ""
+        model_rates = cfg.model_pricing.get(active_model, {})
+        inp_val = model_rates.get("input_cost_per_million")
+        inp = inp_val if inp_val is not None else cfg.capabilities.input_cost_per_million
+        out_val = model_rates.get("output_cost_per_million")
+        out = out_val if out_val is not None else cfg.capabilities.output_cost_per_million
+        cached_val = model_rates.get("cached_input_cost_per_million")
+        cached = cached_val if cached_val is not None else cfg.capabilities.cached_input_cost_per_million
+        
         if inp is None and out is None:
-            inp, out = default_price_per_million(name, cfg.model or "")
+            inp, out, cached_def = default_price_per_million(name, active_model)
+            if cached is None:
+                cached = cached_def
+                
+        # Gather all model-specific overrides for this provider
+        overrides = {}
+        for mname, mrates in cfg.model_pricing.items():
+            overrides[mname] = {
+                "in": mrates.get("input_cost_per_million"),
+                "out": mrates.get("output_cost_per_million"),
+                "cached": mrates.get("cached_input_cost_per_million"),
+            }
+
         provider_pricing[name] = {
             "input_cost_per_million": inp,
             "output_cost_per_million": out,
+            "cached_input_cost_per_million": cached,
             "cost_hint": cfg.capabilities.cost_hint,
-            "model": cfg.model,
+            "model": active_model,
+            "worker_model": cfg.worker_model,
+            "reviewer_model": cfg.reviewer_model,
+            "model_overrides": overrides,
         }
     return {
         "provider": SETTINGS.provider,
@@ -1234,7 +1340,7 @@ async def get_config() -> dict[str, Any]:
         "max_cost_per_provider": SETTINGS.max_cost_per_provider,
         "max_tokens_per_provider": SETTINGS.max_tokens_per_provider,
         "provider_pricing": provider_pricing,
-        "providers": {name: {"model": p.model, "enabled": p.enabled} for name, p in SETTINGS.providers.items()},
+        "providers": {name: {"model": p.model, "worker_model": p.worker_model, "reviewer_model": p.reviewer_model, "enabled": p.enabled} for name, p in SETTINGS.providers.items()},
         "routing_policies": SETTINGS.routing_policies,
     }
 
@@ -1248,38 +1354,67 @@ async def patch_config(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
     updates = {}
+    new_providers = dict(SETTINGS.providers)
+    new_policies = dict(SETTINGS.routing_policies)
+    providers_changed = False
+    policies_changed = False
+
     if "provider" in data:
         updates["provider"] = str(data["provider"])
     if "budget_mode" in data:
         updates["budget_mode"] = str(data["budget_mode"])
-    if "max_cost_per_day" in data:
-        updates["max_cost_per_day"] = float(data["max_cost_per_day"]) if data["max_cost_per_day"] is not None else None
-    if "max_tokens_per_day" in data:
-        updates["max_tokens_per_day"] = int(data["max_tokens_per_day"]) if data["max_tokens_per_day"] is not None else None
-    if "max_cost_per_session" in data:
-        updates["max_cost_per_session"] = float(data["max_cost_per_session"]) if data["max_cost_per_session"] is not None else None
-    if "max_tokens_per_session" in data:
-        updates["max_tokens_per_session"] = int(data["max_tokens_per_session"]) if data["max_tokens_per_session"] is not None else None
-    if "max_cost_per_task" in data:
-        updates["max_cost_per_task"] = float(data["max_cost_per_task"]) if data["max_cost_per_task"] is not None else None
-    if "max_tokens_per_task" in data:
-        updates["max_tokens_per_task"] = int(data["max_tokens_per_task"]) if data["max_tokens_per_task"] is not None else None
-    if "max_cost_per_provider" in data:
-        updates["max_cost_per_provider"] = {str(k): float(v) for k, v in data["max_cost_per_provider"].items()}
-    if "max_tokens_per_provider" in data:
-        updates["max_tokens_per_provider"] = {str(k): int(v) for k, v in data["max_tokens_per_provider"].items()}
+    for key in ["max_cost_per_day", "max_tokens_per_day", "max_cost_per_session", "max_tokens_per_session", "max_cost_per_task", "max_tokens_per_task"]:
+        if key in data:
+            updates[key] = data[key]
+
     if "provider_models" in data:
-        new_providers = dict(SETTINGS.providers)
         for pname, model in data["provider_models"].items():
             if pname in new_providers:
-                new_providers[pname] = replace(new_providers[pname], model=str(model))
-        updates["providers"] = new_providers
+                new_providers[pname] = replace(new_providers[pname], model=str(model) if model else None)
+                providers_changed = True
+
+    if "provider_pricing" in data:
+        for pname, prices in data["provider_pricing"].items():
+            if pname in new_providers:
+                if "model" in prices:
+                    model_name = prices["model"]
+                    m_pricing = dict(new_providers[pname].model_pricing)
+                    m_rates = dict(m_pricing.get(model_name, {}))
+                    if "input_cost_per_million" in prices: m_rates["input_cost_per_million"] = prices["input_cost_per_million"]
+                    if "output_cost_per_million" in prices: m_rates["output_cost_per_million"] = prices["output_cost_per_million"]
+                    if "cached_input_cost_per_million" in prices: m_rates["cached_input_cost_per_million"] = prices["cached_input_cost_per_million"]
+                    m_pricing[model_name] = m_rates
+                    new_providers[pname] = replace(new_providers[pname], model_pricing=m_pricing)
+                else:
+                    cap = new_providers[pname].capabilities
+                    new_cap = replace(
+                        cap,
+                        input_cost_per_million=prices.get("input_cost_per_million", cap.input_cost_per_million),
+                        output_cost_per_million=prices.get("output_cost_per_million", cap.output_cost_per_million),
+                        cached_input_cost_per_million=prices.get("cached_input_cost_per_million", cap.cached_input_cost_per_million),
+                        cost_hint="configured-api"
+                    )
+                    new_providers[pname] = replace(new_providers[pname], capabilities=new_cap)
+                providers_changed = True
+
+    if "provider_roles" in data:
+        for pname, roles in data["provider_roles"].items():
+            if pname in new_providers:
+                if "worker" in roles:
+                    new_providers[pname] = replace(new_providers[pname], worker_model=roles["worker"])
+                if "reviewer" in roles:
+                    new_providers[pname] = replace(new_providers[pname], reviewer_model=roles["reviewer"])
+                providers_changed = True
 
     if "routing_policies" in data:
-        new_policies = dict(SETTINGS.routing_policies)
-        for name, updates in data["routing_policies"].items():
-            existing = new_policies.get(name, {})
-            new_policies[name] = {**existing, **updates}
+        for policy_name, policy_updates in data["routing_policies"].items():
+            existing = new_policies.get(policy_name, {})
+            new_policies[policy_name] = {**existing, **policy_updates}
+            policies_changed = True
+
+    if providers_changed:
+        updates["providers"] = new_providers
+    if policies_changed:
         updates["routing_policies"] = new_policies
 
     if updates:
@@ -1297,6 +1432,25 @@ async def patch_config(request: Request) -> JSONResponse:
         return JSONResponse({"status": "updated", "config": serializable_updates})
 
     return JSONResponse({"status": "no changes"})
+
+
+@app.post("/v1/reset")
+async def reset_usage_stats() -> JSONResponse:
+    ACTIVITY_STATE.clear()
+    ACTIVITY_STATE.update(default_activity_state())
+    
+    # Clear tracking files
+    try:
+        if SETTINGS.usage_file.exists():
+            SETTINGS.usage_file.write_text("{}", encoding="utf-8")
+        if SETTINGS.usage_jsonl_file.exists():
+            SETTINGS.usage_jsonl_file.write_text("", encoding="utf-8")
+        if SETTINGS.audit_log_file.exists():
+            SETTINGS.audit_log_file.write_text("", encoding="utf-8")
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+        
+    return JSONResponse({"status": "reset"})
 
 
 @app.get("/v1/check-provider/{name}")
@@ -1630,15 +1784,11 @@ def response_items_from_chat(
     return output, assistant_messages, reasoning_by_call_id
 
 
+_SUBAGENT_MODELS = {k for k in MODEL_ALIASES if k != "deepseek-chat"}
+
+
 def is_subagent_model(model: str) -> bool:
-    return model in {
-        "deepseek-worker",
-        "deepseek-reviewer",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "deepseek-lite",
-        "deepseek-prod",
-    } or model.startswith("subagent-")
+    return model in _SUBAGENT_MODELS or model.startswith("subagent-")
 
 
 def subagent_final_lacks_write_evidence(
@@ -1761,15 +1911,36 @@ def normalize_usage(usage: Any) -> dict[str, Any]:
             "output_tokens_details": {"reasoning_tokens": 0},
         }
 
-    input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    cache_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+    if not isinstance(cache_details, dict):
+        cache_details = {}
+
+    cached_tokens = int(
+        usage.get("prompt_cache_hit_tokens")
+        or usage.get("input_cache_hit_tokens")
+        or cache_details.get("cached_tokens")
+        or 0
+    )
+    cache_miss_tokens = int(
+        usage.get("prompt_cache_miss_tokens")
+        or usage.get("input_cache_miss_tokens")
+        or 0
+    )
+    input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or cached_tokens + cache_miss_tokens)
     output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
     total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+
+    output_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
+    if not isinstance(output_details, dict):
+        output_details = {}
+    reasoning_tokens = int(output_details.get("reasoning_tokens") or 0)
+
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
-        "input_tokens_details": {"cached_tokens": 0},
-        "output_tokens_details": {"reasoning_tokens": 0},
+        "input_tokens_details": {"cached_tokens": min(input_tokens, cached_tokens)},
+        "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
     }
 
 

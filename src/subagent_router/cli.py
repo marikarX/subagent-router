@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import select
 import tarfile
 import time
 import tomllib
@@ -492,6 +493,13 @@ def cmd_tui(args: argparse.Namespace) -> int:
         except Exception:
             return False
 
+    def post_remote_reset():
+        try:
+            httpx.post(f"{base_url}/v1/reset", timeout=2.0)
+            return True
+        except Exception:
+            return False
+
     def check_remote_provider(name):
         try:
             resp = httpx.get(f"{base_url}/v1/check-provider/{name}", timeout=6.0)
@@ -505,9 +513,17 @@ def cmd_tui(args: argparse.Namespace) -> int:
         if role == "default":
             return patch_remote_config({"provider_models": {pname: new_model}})
         elif role == "worker":
-            return patch_remote_config({"routing_policies": {"safe-default": {"model": new_model}}})
+            # Set provider-specific worker model and clear any global override
+            return patch_remote_config({
+                "provider_roles": {pname: {"worker": new_model}},
+                "routing_policies": {"safe-default": {"model": None}}
+            })
         elif role == "reviewer":
-            return patch_remote_config({"routing_policies": {"cheap-review": {"model": new_model}}})
+            # Set provider-specific reviewer model and clear any global override
+            return patch_remote_config({
+                "provider_roles": {pname: {"reviewer": new_model}},
+                "routing_policies": {"cheap-review": {"model": None}}
+            })
         return False
 
     def generate_dashboard(remote_config=None) -> Layout:
@@ -624,6 +640,35 @@ def cmd_tui(args: argparse.Namespace) -> int:
     stop_event = Event()
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
 
+    def read_tui_key() -> str | None:
+        ch = sys.stdin.read(1)
+        if not ch:
+            return None
+        if ch != "\x1b":
+            return ch
+        # Non-blocking read for escape sequence continuation
+        if not select.select([sys.stdin], [], [], 0.3)[0]:
+            return "\x1b"
+        second = sys.stdin.read(1)
+        if second != "[":
+            return "\x1b"
+        if not select.select([sys.stdin], [], [], 0.1)[0]:
+            return "\x1b"
+        third = sys.stdin.read(1)
+        if third == "A":
+            return "up"
+        if third == "B":
+            return "down"
+        if third == "5":
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                sys.stdin.read(1)
+            return "page_up"
+        if third == "6":
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                sys.stdin.read(1)
+            return "page_down"
+        return None
+
     def input_thread_func():
         import sys, tty, termios
         if not is_tty:
@@ -646,7 +691,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
             # and garbling all Rich layout output)
             tty.setcbreak(fd)
             while not stop_event.is_set():
-                ch = sys.stdin.read(1)
+                ch = read_tui_key()
                 if not ch:
                     break
                 input_queue.put(ch)
@@ -678,6 +723,12 @@ def cmd_tui(args: argparse.Namespace) -> int:
             self.model_menu_options = []
             self.model_input = ""
             self.model_menu_role = "default"  # "default", "worker", "reviewer"
+            # Cost input state
+            self.cost_provider = None
+            self.cost_model = None
+            self.cost_field = None
+            self.cost_menu_options = []
+            self.activity_offset = 0
 
     state = TUIState()
 
@@ -705,6 +756,8 @@ def cmd_tui(args: argparse.Namespace) -> int:
         current_provider = remote.get("provider") if remote else settings.provider
         current_mode = remote.get("budget_mode") if remote else settings.budget_mode
 
+        cfg = remote or {}
+
         # Config info
         config_info = Table(show_header=False, box=None, padding=(0, 1))
         config_info.add_row("[bold]Status:[/bold]", "[green]UP[/green]" if remote else "[red]DOWN[/red]")
@@ -723,25 +776,70 @@ def cmd_tui(args: argparse.Namespace) -> int:
             model_name = provider_cfg.model if provider_cfg else 'unknown'
 
         config_info.add_row("[bold]Model:[/bold]", f"[cyan]{model_name}[/cyan]")
+        
+        # Routing policies (Worker/Reviewer)
+        policies = cfg.get("routing_policies", {})
+        
+        # Role Assignments (Worker/Reviewer)
+        pricing = remote.get("provider_pricing", {}) if remote else {}
+        cur_pricing = pricing.get(current_provider, {})
+
+        for role_name, policy_key in [("Worker", "safe-default"), ("Reviewer", "cheap-review")]:
+            policy = policies.get(policy_key, {})
+            p_provider = policy.get("provider")
+            p_model = policy.get("model")
+            
+            # If no global policy, check current provider's specific role assignment
+            if not p_provider and not p_model:
+                p_model = cur_pricing.get("worker_model" if role_name == "Worker" else "reviewer_model")
+                if p_model:
+                    p_provider = current_provider
+
+            if p_provider or p_model:
+                p_val = f"[cyan]{p_model or model_name}[/cyan]"
+                if p_provider:
+                    p_val += f" [dim]on {p_provider}[/dim]"
+                config_info.add_row(f"[bold]{role_name}:[/bold]", p_val)
+
         config_info.add_row("[bold]Budget Mode:[/bold]", f"[yellow]{current_mode}[/yellow]")
         config_info.add_row("[bold]Fallbacks:[/bold]", f"[dim]{', '.join(settings.fallback_providers) or 'none'}[/dim]")
 
         # Show API pricing per provider in config panel
-        cfg = remote or {}
         pricing = cfg.get("provider_pricing") or {}
         if pricing:
             config_info.add_row("", "")  # spacer
             for pname, pdata in pricing.items():
+                active_model = str(pdata.get("model") or "default")
+                
+                # Provider header
+                config_info.add_row(f"[bold]{pname}:[/bold]", "")
+                
+                # Active model row
                 inp = pdata.get("input_cost_per_million")
                 out = pdata.get("output_cost_per_million")
+                cached = pdata.get("cached_input_cost_per_million")
                 hint = pdata.get("cost_hint", "")
+                
                 if inp is not None or out is not None:
-                    rate_str = f"[dim]in[/dim] ${inp or 0:.2f}  [dim]out[/dim] ${out or 0:.2f}"
+                    rate_str = f"[dim]in[/dim] ${inp or 0:.4f}  [dim]hit[/dim] ${cached or 0:.4f}  [dim]out[/dim] ${out or 0:.4f}"
                 elif hint == "zero-api-cost":
                     rate_str = "[green]free (local)[/green]"
                 else:
                     rate_str = "[dim]unknown[/dim]"
-                config_info.add_row(f"[bold]{pname}:[/bold]", rate_str)
+                
+                config_info.add_row(f"  [bold cyan]* {active_model}[/bold cyan]:", rate_str)
+                
+                # Other model-specific overrides
+                overrides = pdata.get("model_overrides", {})
+                for mname, mrates in overrides.items():
+                    mname_str = str(mname or "")
+                    if mname_str == active_model:
+                        continue
+                    m_inp = mrates.get("in") or 0
+                    m_hit = mrates.get("cached") or 0
+                    m_out = mrates.get("out") or 0
+                    m_rate_str = f"[dim]in[/dim] ${m_inp:.4f}  [dim]hit[/dim] ${m_hit:.4f}  [dim]out[/dim] ${m_out:.4f}"
+                    config_info.add_row(f"  [dim]→ {mname_str}:[/dim]", m_rate_str)
 
         # Budget info — comprehensive view
         budget_info = Table(show_header=False, box=None, padding=(0, 1))
@@ -750,6 +848,84 @@ def cmd_tui(args: argparse.Namespace) -> int:
             return f"${v:.4f}" if v is not None else "[dim]none[/dim]"
         def _fmt_tokens(v):
             return f"{v:,}" if v is not None else "[dim]none[/dim]"
+        def _usage_counts(usage):
+            usage = usage if isinstance(usage, dict) else {}
+            details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+            if not isinstance(details, dict):
+                details = {}
+            cached = int(
+                usage.get("prompt_cache_hit_tokens")
+                or usage.get("input_cache_hit_tokens")
+                or details.get("cached_tokens")
+                or 0
+            )
+            input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or cached)
+            output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+            return {
+                "input": input_tokens,
+                "cached": min(input_tokens, cached),
+                "output": output_tokens,
+                "total": total_tokens,
+            }
+        def _daily_token_counts(usage, day_data):
+            counts = {
+                "input": int(day_data.get("input_tokens") or 0),
+                "cached": int(day_data.get("cached_input_tokens") or 0),
+                "output": int(day_data.get("output_tokens") or 0),
+                "total": int(day_data.get("total_tokens") or 0),
+            }
+            if counts["input"] or counts["cached"] or counts["output"]:
+                return counts
+            today = dt.date.today().isoformat()
+            for record in usage.get("records") or []:
+                if not isinstance(record, dict):
+                    continue
+                raw_ts = record.get("timestamp")
+                if not isinstance(raw_ts, (int, float)):
+                    continue
+                if dt.datetime.fromtimestamp(raw_ts).date().isoformat() != today:
+                    continue
+                rc = _usage_counts(record.get("usage"))
+                counts["input"] += rc["input"]
+                counts["cached"] += rc["cached"]
+                counts["output"] += rc["output"]
+                counts["total"] += rc["total"]
+            return counts
+        def _error_detail(entry):
+            for key in ("message", "error", "reason"):
+                value = entry.get(key)
+                if value:
+                    return str(value)
+            chain = entry.get("fallback_chain") or []
+            for attempt in reversed(chain):
+                if not isinstance(attempt, dict):
+                    continue
+                parts = [
+                    str(attempt.get("status_code") or "").strip(),
+                    str(attempt.get("error_category") or "").strip(),
+                    str(attempt.get("error") or "").strip(),
+                ]
+                detail = " ".join(part for part in parts if part)
+                if detail:
+                    return detail
+            return ""
+        def _activity_status(entry):
+            status = str(entry.get("status") or "")
+            if status in {"success", "ok"}:
+                return "[green]OK[/green]", ""
+            if status == "incomplete-output-retry":
+                return "[yellow]RETRY[/yellow]", str(entry.get("reason") or "provider output incomplete; retrying")
+            if status == "synthetic-continuation":
+                tool = entry.get("tool")
+                detail = str(entry.get("reason") or "continuing subagent turn")
+                if tool:
+                    detail = f"{detail}; tool={tool}"
+                return "[blue]CONT[/blue]", detail
+            return "[red]ERR[/red]", _error_detail(entry)
+        def _clip(value, limit=72):
+            text = " ".join(str(value).split())
+            return text if len(text) <= limit else text[: limit - 1] + "..."
 
         budget_info.add_row("[bold]Daily $:[/bold]",   _fmt_cost(cfg.get("max_cost_per_day") or settings.max_cost_per_day))
         budget_info.add_row("[bold]Daily Tok:[/bold]",  _fmt_tokens(cfg.get("max_tokens_per_day") or settings.max_tokens_per_day))
@@ -768,55 +944,73 @@ def cmd_tui(args: argparse.Namespace) -> int:
                 today = dt.date.today().isoformat()
                 day_data = usage.get("daily_usage", {}).get(today, {})
                 daily_cost = float(day_data.get("total_cost_usd", 0.0))
-                daily_tokens = int(day_data.get("total_tokens", 0))
+                daily_tokens = _daily_token_counts(usage, day_data)
                 max_cost = cfg.get("max_cost_per_day") or settings.max_cost_per_day
                 cost_color = "green"
                 if max_cost and daily_cost >= max_cost: cost_color = "red"
                 elif max_cost and daily_cost >= max_cost * 0.8: cost_color = "yellow"
                 budget_info.add_row("", "")  # spacer
                 budget_info.add_row("[bold]Today $:[/bold]", f"[{cost_color}]{daily_cost:.4f}[/{cost_color}]")
-                budget_info.add_row("[bold]Today Tok:[/bold]", f"{daily_tokens:,}")
+                budget_info.add_row(
+                    "[bold]Today Tok:[/bold]",
+                    (
+                        f"[cyan]{daily_tokens['input']:,}[/cyan] / "
+                        f"[green]{daily_tokens['cached']:,}[/green] / "
+                        f"[magenta]{daily_tokens['output']:,}[/magenta] "
+                        f"[dim](total {daily_tokens['total']:,})[/dim]"
+                    ),
+                )
             except Exception:
                 pass
 
         # Activity table
         activity_table = Table(box=None, expand=True, header_style="bold magenta")
         activity_table.add_column("Time", style="dim", width=10)
-        activity_table.add_column("Status", width=8)
+        activity_table.add_column("Status", width=28)
         activity_table.add_column("Provider", width=15)
         activity_table.add_column("Model", width=25)
         activity_table.add_column("Toks (in/cache/out)", justify="right")
-        activity_table.add_column("Cost", justify="right")
+        activity_table.add_column("Req Cost", justify="right")
 
         if settings.audit_log_file.exists():
             try:
                 with settings.audit_log_file.open("rb") as f:
                     f.seek(0, 2)
                     size = f.tell()
-                    f.seek(max(0, size - 4096))
+                    f.seek(max(0, size - 256 * 1024))
                     tail = f.read().decode("utf-8", errors="replace")
                 lines = [l for l in tail.strip().split("\n") if l.strip()]
-                for al in lines[-5:][::-1]:
+                visible_rows = 5
+                max_offset = max(0, len(lines) - visible_rows)
+                state.activity_offset = min(max(state.activity_offset, 0), max_offset)
+                end = len(lines) - state.activity_offset
+                start = max(0, end - visible_rows)
+                for al in lines[start:end][::-1]:
                     entry = json.loads(al)
                     raw_ts = entry.get("timestamp")
                     ts = dt.datetime.fromtimestamp(raw_ts).strftime("%H:%M:%S") if isinstance(raw_ts, (int, float)) else "??:??:??"
-                    st = "[green]OK[/green]" if entry.get("status") in ("success", "ok") else "[red]ERR[/red]"
+                    st, detail = _activity_status(entry)
+                    if detail:
+                        st = f"{st} {_clip(detail, 48)}"
 
-                    usage = entry.get("usage") or {}
                     try:
-                        t_in = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
-                        t_out = int(usage.get("completion_tokens", usage.get("output_tokens", 0)))
-                        t_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
-                        t_cached = int(t_details.get("cached_tokens", 0))
+                        counts = _usage_counts(entry.get("usage"))
                     except (ValueError, TypeError):
-                        t_in = t_out = t_cached = 0
+                        counts = {"input": 0, "cached": 0, "output": 0}
 
-                    if t_in > 0 or t_out > 0:
-                        t_str = f"[cyan]{t_in}[/cyan] / [green]{t_cached}[/green] / [magenta]{t_out}[/magenta]"
+                    if counts["input"] > 0 or counts["output"] > 0:
+                        t_str = f"[cyan]{counts['input']}[/cyan] / [green]{counts['cached']}[/green] / [magenta]{counts['output']}[/magenta]"
                     else:
                         t_str = ""
 
-                    activity_table.add_row(ts, st, entry.get("provider", "???"), str(entry.get("model", "???")), t_str, f"${entry.get('estimated_cost_usd', 0.0):.4f}")
+                    activity_table.add_row(
+                        ts,
+                        st,
+                        entry.get("provider", "???"),
+                        str(entry.get("model", "???")),
+                        t_str,
+                        f"${entry.get('estimated_cost_usd', 0.0):.4f}",
+                    )
             except Exception:
                 activity_table.add_row("", "[yellow]Audit log error[/yellow]", "", "", "", "")
         else:
@@ -824,7 +1018,11 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
         # Footer text — context-sensitive
         if state.menu == "provider":
-            footer_text = "[bold yellow]Switch Provider:[/bold yellow] [1] DeepSeek  [2] Groq  [3] Ollama  [Any] Back"
+            providers = sorted(remote.get("providers", {}).keys()) if remote else ["deepseek", "groq", "ollama"]
+            opts = []
+            for i, p in enumerate(providers[:9]):
+                opts.append(f"[{i+1}] {p.capitalize()}")
+            footer_text = "[bold yellow]Switch Provider:[/bold yellow] " + "  ".join(opts) + "  [Any] Back"
         elif state.menu == "model_role":
             footer_text = "[bold yellow]Assign Model to Role:[/bold yellow] [1] Global Default  [2] Worker  [3] Reviewer  [Any] Back"
         elif state.menu == "model":
@@ -843,10 +1041,28 @@ def cmd_tui(args: argparse.Namespace) -> int:
             footer_text = "  ".join(lines_parts)
         elif state.menu == "budget_input":
             footer_text = f"[bold cyan]Set {state.budget_field}:[/bold cyan] [white]{state.budget_input}▌[/white]  (Enter=Apply  Esc/0=Cancel)"
+        elif state.menu == "cost_provider":
+            providers = sorted(remote.get("providers", {}).keys()) if remote else ["deepseek", "groq", "ollama"]
+            opts = []
+            for i, p in enumerate(providers[:9]):
+                opts.append(f"[{i+1}] {p.capitalize()}")
+            footer_text = "[bold yellow]Select Provider to Edit Costs:[/bold yellow] " + "  ".join(opts) + "  [0] Back"
+        elif state.menu == "cost_model":
+            footer_text = f"[bold yellow]Select Model for {state.cost_provider}:[/bold yellow] "
+            opts = []
+            for i, opt in enumerate(state.cost_menu_options[:9]):
+                opts.append(f"[{i+1}] {opt}")
+            footer_text += "  ".join(opts) + "  [0] Back"
+        elif state.menu == "cost_field":
+            target = f"{state.cost_provider} ({state.cost_model})" if state.cost_model else state.cost_provider
+            footer_text = f"[bold yellow]Edit {target} Rates:[/bold yellow] [1] Input  [2] Output  [3] Cached  [0] Back"
+        elif state.menu == "cost_input":
+            target = f"{state.cost_provider} {state.cost_model}" if state.cost_model else state.cost_provider
+            footer_text = f"[bold cyan]Set {target} {state.cost_field} cost/1M:[/bold cyan] [white]${state.budget_input}▌[/white]  (Enter=Apply  Esc/0=Cancel)"
         elif state.message:
             footer_text = state.message
         else:
-            footer_text = r"[bold]Actions:[/bold]  \[P] Provider  \[L] Model  \[B] Budget  \[M] Mode  \[R] Reset  \[Q] Quit"
+            footer_text = r"[bold]Actions:[/bold]  ↑ older  ↓ newer  PgUp/PgDn page  \[P] Provider  \[L] Model  \[C] Cost  \[B] Budget  \[M] Mode  \[R] Reset Usage  \[X] Clear Config  \[Q] Quit"
 
         return config_info, budget_info, activity_table, footer_text
 
@@ -855,8 +1071,8 @@ def cmd_tui(args: argparse.Namespace) -> int:
         layout = Layout()
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="stats", size=14),
-            Layout(name="activity"),
+            Layout(name="stats", ratio=2),
+            Layout(name="activity", ratio=1),
             Layout(name="footer", size=3),
         )
         return layout
@@ -930,12 +1146,25 @@ def cmd_tui(args: argparse.Namespace) -> int:
                     if state.menu == "main":
                         if ch == 'q' or ch == '\x03':
                             stop_event.set()
+                        elif ch in {"up", "page_up", "k"}:
+                            state.activity_offset += 5 if ch == "page_up" else 1
+                        elif ch in {"down", "page_down", "j"}:
+                            step = 5 if ch == "page_down" else 1
+                            state.activity_offset = max(0, state.activity_offset - step)
                         elif ch == 'p':
                             state.menu = "provider"
                         elif ch == 'b':
                             state.menu = "budget"
+                        elif ch == 'c':
+                            state.menu = "cost_provider"
                         elif ch == 'l':
                             state.menu = "model_role"
+                        elif ch == 'r':
+                            if post_remote_reset():
+                                state.message = "[green]Usage and budget state reset successfully.[/green]"
+                            else:
+                                state.message = "[red]Failed to reset (server unreachable)[/red]"
+                            state.message_expiry = now + 3
                         elif ch == 'm':
                             cur = (state.last_config.get("budget_mode") if state.last_config else settings.budget_mode)
                             new_mode = "hard-stop" if cur == "warn" else "warn"
@@ -943,6 +1172,22 @@ def cmd_tui(args: argparse.Namespace) -> int:
                                 state.last_config = get_remote_config()
                                 state.message = f"[green]Mode → {new_mode}[/green]"
                                 state.message_expiry = now + 2
+                        elif ch == 'x':
+                            # Reset all config overrides (models and roles)
+                            updates = {
+                                "provider_models": {p: None for p in settings.providers},
+                                "routing_policies": {
+                                    "safe-default": {"provider": None, "model": None},
+                                    "cheap-review": {"provider": None, "model": None}
+                                }
+                            }
+                            if patch_remote_config(updates):
+                                state.last_config = get_remote_config()
+                                state.message = "[green]Configuration overrides cleared.[/green]"
+                                state.message_expiry = now + 3
+                            else:
+                                state.message = "[red]Failed to reset config[/red]"
+                                state.message_expiry = now + 3
 
                     elif state.menu == "model_role":
                         role_map = {"1": "default", "2": "worker", "3": "reviewer"}
@@ -970,9 +1215,9 @@ def cmd_tui(args: argparse.Namespace) -> int:
                             state.menu = "main"
 
                     elif state.menu == "provider":
-                        p_map = {"1": "deepseek", "2": "groq", "3": "ollama"}
-                        if ch in p_map:
-                            new_p = p_map[ch]
+                        providers = sorted(state.last_config.get("providers", {}).keys()) if state.last_config else ["deepseek", "groq", "ollama"]
+                        if ch.isdigit() and 1 <= int(ch) <= len(providers):
+                            new_p = providers[int(ch) - 1]
                             if patch_remote_config({"provider": new_p}):
                                 state.last_config = get_remote_config()
                                 state.message = f"[green]Provider → {new_p}[/green] [dim](checking health...)[/dim]"
@@ -1069,6 +1314,88 @@ def cmd_tui(args: argparse.Namespace) -> int:
                         elif choice == '\x1b':  # escape
                             state.menu = "budget"
                             state.budget_field = None
+                            state.budget_input = ""
+
+                    elif state.menu == "cost_provider":
+                        if ch == '0' or ch == '\x1b':
+                            state.menu = "main"
+                        else:
+                            providers = sorted(state.last_config.get("providers", {}).keys()) if state.last_config else ["deepseek", "groq", "ollama"]
+                            if ch.isdigit() and 1 <= int(ch) <= len(providers):
+                                cp = providers[int(ch) - 1]
+                                state.cost_provider = cp
+                                state.message = f"[dim]Fetching models for {cp}...[/dim]"
+                                state.message_expiry = now + 10
+                                state.needs_update = True
+
+                                def fetch_cost_models(pname):
+                                    res = check_remote_provider(pname)
+                                    state.available_models[pname] = res.get("models", [])
+                                    state.cost_menu_options = res.get("models", [])
+                                    state.menu = "cost_model"
+                                    state.message = ""
+                                    state.needs_update = True
+
+                                Thread(target=fetch_cost_models, args=(cp,), daemon=True).start()
+                            else:
+                                state.menu = "main"
+
+                    elif state.menu == "cost_model":
+                        if ch == '0' or ch == '\x1b':
+                            state.menu = "cost_provider"
+                        elif ch.isdigit() and 1 <= int(ch) <= len(state.cost_menu_options):
+                            state.cost_model = state.cost_menu_options[int(ch) - 1]
+                            state.menu = "cost_field"
+                        else:
+                            state.menu = "main"
+
+                    elif state.menu == "cost_field":
+                        if ch == '0' or ch == '\x1b':
+                            state.menu = "cost_model"
+                        else:
+                            f_map = {"1": "input_cost_per_million", "2": "output_cost_per_million", "3": "cached_input_cost_per_million"}
+                            if ch in f_map:
+                                state.cost_field = f_map[ch]
+                                state.budget_input = ""
+                                state.menu = "cost_input"
+                            else:
+                                state.menu = "cost_model"
+
+                    elif state.menu == "cost_input":
+                        if choice in '0123456789.':
+                            state.budget_input += choice
+                        elif choice == '\x7f' or choice == '\x08':  # backspace
+                            state.budget_input = state.budget_input[:-1]
+                        elif choice == '\x1b':  # escape
+                            state.menu = "cost_field"
+                        elif choice == '\r' or choice == '\n':  # enter
+                            if state.budget_input:
+                                try:
+                                    val = float(state.budget_input)
+                                    pricing_data = {state.cost_field: val}
+                                    if state.cost_model:
+                                        pricing_data["model"] = state.cost_model
+                                    updates = {
+                                        "provider_pricing": {
+                                            state.cost_provider: pricing_data
+                                        }
+                                    }
+                                    if patch_remote_config(updates):
+                                        state.last_config = get_remote_config()
+                                        state.message = f"[green]Updated {state.cost_provider} {state.cost_field} → {val}[/green]"
+                                        state.message_expiry = now + 3
+                                    else:
+                                        state.message = "[red]Failed to update (server unreachable)[/red]"
+                                        state.message_expiry = now + 2
+                                except ValueError:
+                                    state.message = "[red]Invalid number[/red]"
+                                    state.message_expiry = now + 2
+                            state.menu = "main"
+                            state.cost_provider = None
+                            state.cost_field = None
+                            state.budget_input = ""
+                        elif choice == '\x1b' or choice == '0':  # escape
+                            state.menu = "cost_field"
                             state.budget_input = ""
 
                 except queue.Empty:

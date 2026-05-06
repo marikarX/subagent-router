@@ -440,6 +440,35 @@ class NormalizationTests(unittest.TestCase):
                 }
             )
 
+    def test_developer_message_between_tool_call_and_output_is_delayed(self):
+        normalized = normalize_request(
+            {
+                "model": "deepseek-chat",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": "{}",
+                        "call_id": "call_123",
+                    },
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "Approved command prefix saved"}],
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_123",
+                        "output": "ok",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(normalized.messages[0]["tool_calls"][0]["id"], "call_123")
+        self.assertEqual(normalized.messages[1], {"role": "tool", "tool_call_id": "call_123", "content": "ok"})
+        self.assertEqual(normalized.messages[2], {"role": "system", "content": "Approved command prefix saved"})
+
     def test_previous_response_state_allows_delta_tool_output(self):
         normalized = normalize_request(
             {

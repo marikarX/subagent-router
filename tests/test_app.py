@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import io
 import json
 import tempfile
@@ -18,7 +19,12 @@ class AppTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.original_settings = proxy_app.SETTINGS
-        proxy_app.SETTINGS = proxy_app.Settings.from_env()
+        
+        # Isolate tests from user's real ~/.subagent_router config
+        mock_state_dir = Path(self.tempdir.name) / "state"
+        mock_state_dir.mkdir()
+        
+        proxy_app.SETTINGS = proxy_app.Settings.from_env(env={"SUBAGENT_ROUTER_STATE_DIR": str(mock_state_dir)})
         proxy_app.SETTINGS.mock_deepseek = True
         proxy_app.SETTINGS.trace_enabled = False
         proxy_app.SETTINGS.log_dir = Path(self.tempdir.name)
@@ -32,6 +38,7 @@ class AppTests(unittest.TestCase):
         proxy_app.REASONING_CONTENT_BY_CALL_ID.clear()
         proxy_app.REASONING_CONTENT_BY_ASSISTANT_TEXT.clear()
         proxy_app.SESSION_EVENTS.clear()
+        proxy_app.LAST_FINAL_SESSION_EVENT = None
         proxy_app.ACTIVITY_STATE.update(
             {
                 "started_at": None,
@@ -637,6 +644,57 @@ class AppTests(unittest.TestCase):
         self.assertEqual(proxy_app.ACTIVITY_STATE["error_count"], 0)
         self.assertIsNotNone(proxy_app.ACTIVITY_STATE["last_model"])
 
+    def test_create_response_after_reset_restores_activity_defaults(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(proxy_app.app)
+
+        reset_response = client.post("/v1/reset")
+        response = client.post(
+            "/v1/responses",
+            json={"model": "deepseek-chat", "stream": False, "input": "hello", "tools": []},
+        )
+
+        self.assertEqual(reset_response.status_code, 200)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(proxy_app.ACTIVITY_STATE["request_count"], 1)
+        self.assertEqual(proxy_app.ACTIVITY_STATE["response_count"], 1)
+        self.assertEqual(proxy_app.ACTIVITY_STATE["error_count"], 0)
+        self.assertIn("started_at", proxy_app.ACTIVITY_STATE)
+
+    def test_create_response_records_normalization_error_in_audit(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(proxy_app.app)
+        payload = {
+            "model": "deepseek-reviewer",
+            "stream": False,
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{}",
+                    "call_id": "call_123",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "bad"}],
+                },
+            ],
+            "tools": [],
+        }
+
+        response = client.post("/v1/responses", json=payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(proxy_app.ACTIVITY_STATE["error_count"], 1)
+        self.assertEqual(proxy_app.ACTIVITY_STATE["last_model"], "deepseek-reviewer")
+        audit = proxy_app.SETTINGS.audit_log_file.read_text(encoding="utf-8")
+        self.assertIn('"status": "error"', audit)
+        self.assertIn('"model": "deepseek-reviewer"', audit)
+        self.assertIn('"provider": "deepseek"', audit)
+
     def test_create_response_records_provider_metadata_usage_and_audit(self):
         from fastapi.testclient import TestClient
 
@@ -657,6 +715,26 @@ class AppTests(unittest.TestCase):
         self.assertEqual(usage["request_count"], 1)
         self.assertEqual(usage["requests_by_provider"]["deepseek"], 1)
         self.assertTrue(proxy_app.SETTINGS.usage_jsonl_file.exists())
+
+    def test_subagent_alias_overrides_provider_default_model_in_audit(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(proxy_app.app)
+        payload = {
+            "model": "deepseek-reviewer",
+            "stream": False,
+            "input": "read-only smoke test",
+            "tools": [],
+        }
+
+        response = client.post("/v1/responses", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["metadata"]["provider_model"], "deepseek-v4-pro")
+        audit = proxy_app.SETTINGS.audit_log_file.read_text(encoding="utf-8")
+        self.assertIn('"model": "deepseek-v4-pro"', audit)
+        self.assertNotIn('"model": "deepseek-v4-flash"', audit)
 
     def test_provider_manual_override_routes_to_mocked_ollama(self):
         from fastapi.testclient import TestClient
@@ -1027,6 +1105,33 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(paths, proxy_app.SETTINGS.sanitized_paths())
 
+    def test_usage_record_tracks_input_cache_output_daily_totals(self):
+        proxy_app.write_usage_record(
+            {
+                "timestamp": 1,
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 25,
+                    "total_tokens": 125,
+                    "prompt_tokens_details": {"cached_tokens": 40},
+                },
+                "estimated_cost_usd": 0.001,
+            }
+        )
+
+        summary = json.loads(proxy_app.SETTINGS.usage_file.read_text())
+        today = datetime.date.today().isoformat()
+        day = summary["daily_usage"][today]
+
+        self.assertEqual(summary["total_input_tokens"], 100)
+        self.assertEqual(summary["total_cached_input_tokens"], 40)
+        self.assertEqual(summary["total_output_tokens"], 25)
+        self.assertEqual(day["input_tokens"], 100)
+        self.assertEqual(day["cached_input_tokens"], 40)
+        self.assertEqual(day["output_tokens"], 25)
+
     def test_activity_file_reports_recent_activity(self):
         proxy_app.record_activity("request", trace_id="trace1", model="deepseek-reviewer")
         proxy_app.record_activity(
@@ -1084,6 +1189,34 @@ class AppTests(unittest.TestCase):
         self.assertEqual(mirror["latest"]["messages"], [final_message])
         self.assertEqual(mirror["final"]["messages"], [final_message])
         self.assertNotIn("private chain of thought", json.dumps(mirror))
+
+    def test_session_mirror_keeps_last_final_when_event_window_rolls(self):
+        final_message = "Detailed final result"
+        normalized = normalize_request(
+            {
+                "model": "deepseek-reviewer",
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "review"}]}],
+                "tools": [],
+            }
+        )
+        final_response = {
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": final_message}]}],
+            "usage": {"total_tokens": 12},
+            "end_turn": True,
+        }
+        tool_response = {
+            "output": [{"type": "function_call", "name": "exec_command", "call_id": "call_1", "arguments": "{}"}],
+            "usage": {"total_tokens": 1},
+            "end_turn": False,
+        }
+
+        proxy_app.record_session_response("trace-final", normalized, final_response)
+        for index in range(proxy_app.MAX_SESSION_EVENTS + 1):
+            proxy_app.record_session_response(f"trace-tool-{index}", normalized, tool_response)
+
+        mirror = json.loads(proxy_app.SETTINGS.session_mirror_file.read_text())
+
+        self.assertEqual(mirror["final"]["messages"], [final_message])
 
     def test_image_generation_is_logged_redacted_and_dropped(self):
         payload = {
@@ -1419,6 +1552,60 @@ class AppTests(unittest.TestCase):
             proxy_app.read_usage_summary.cache_clear() if hasattr(proxy_app.read_usage_summary, "cache_clear") else None
             if proxy_app.SETTINGS.usage_file.exists():
                 proxy_app.SETTINGS.usage_file.unlink()
+
+    def test_normalize_usage_preserves_deepseek_cache_hit_tokens(self):
+        usage = proxy_app.normalize_usage(
+            {
+                "prompt_tokens": 2_059_216,
+                "completion_tokens": 29_463,
+                "total_tokens": 2_088_679,
+                "prompt_cache_hit_tokens": 1_937_024,
+                "prompt_cache_miss_tokens": 122_192,
+                "completion_tokens_details": {"reasoning_tokens": 17},
+            }
+        )
+
+        self.assertEqual(usage["input_tokens"], 2_059_216)
+        self.assertEqual(usage["output_tokens"], 29_463)
+        self.assertEqual(usage["total_tokens"], 2_088_679)
+        self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 1_937_024)
+        self.assertEqual(usage["output_tokens_details"]["reasoning_tokens"], 17)
+
+    def test_deepseek_v4_pro_cost_uses_discounted_cache_hit_rate(self):
+        usage = proxy_app.normalize_usage(
+            {
+                "prompt_tokens": 2_029_753,
+                "completion_tokens": 29_463,
+                "prompt_cache_hit_tokens": 1_937_024,
+                "prompt_cache_miss_tokens": 92_729,
+            }
+        )
+
+        cost = proxy_app.estimate_cost_usd(
+            usage,
+            proxy_app.SETTINGS.providers["deepseek"],
+            "deepseek-v4-pro",
+        )
+
+        self.assertEqual(cost, 0.07299164)
+
+    def test_deepseek_v4_flash_cost_charges_cache_misses_separately(self):
+        usage = proxy_app.normalize_usage(
+            {
+                "prompt_tokens": 4_721_663,
+                "completion_tokens": 52_614,
+                "prompt_cache_hit_tokens": 4_563_968,
+                "prompt_cache_miss_tokens": 157_695,
+            }
+        )
+
+        cost = proxy_app.estimate_cost_usd(
+            usage,
+            proxy_app.SETTINGS.providers["deepseek"],
+            "deepseek-v4-flash",
+        )
+
+        self.assertEqual(cost, 0.04958833)
 
 
     # ---------- error_category tests ----------
