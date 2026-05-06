@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+## [0.2.2] - 2026-05-05
+
+### Added
+
+- Added cached-input pricing support to provider capabilities, provider
+  configuration, runtime config persistence, and `/v1/config` responses.
+- Added per-model provider pricing overrides and provider-level worker and
+  reviewer model assignments.
+- Added runtime config updates for provider pricing, provider roles, nullable
+  provider model overrides, and selectively persisted routing policy changes.
+- Added a `POST /v1/reset` endpoint that clears in-memory activity state and
+  removes usage, usage JSONL, and audit log files.
+- Added TUI support for arrow and page-key navigation, remote reset calls,
+  provider role display, cached-input pricing, and model-specific pricing
+  overrides.
+
+### Changed
+
+- Bumped Python and npm package versions to `0.2.2`.
+- Updated usage normalization to parse cached-token and reasoning-token counts
+  from provider responses instead of reporting those fields as zero.
+- Updated usage summaries to track total input, cached input, and output tokens
+  in global and daily usage records.
+- Updated subagent model detection to derive supported aliases from the shared
+  model alias table.
+- Updated activity and audit diagnostics to retain final session events across
+  mirror truncation and include selected provider/model context on failures.
+
+### Fixed
+
+- Fixed request normalization for system or developer messages that appear
+  between a tool call and its tool output by delaying those messages until after
+  the tool output.
+- Fixed runtime config serialization so provider entries include pricing, role
+  assignments, and model pricing while omitting null pricing values.
+- Fixed TUI model switching so provider-specific worker and reviewer model
+  choices are saved as provider role settings and global routing model
+  overrides are cleared.
+
 ## [0.2.1] - 2026-05-05
 
 ### Added
