@@ -29,7 +29,7 @@ from .normalization import (
     normalize_request,
     redact,
 )
-from .activation import DEFAULT_PROFILE, normalize_profile
+from .activation import normalize_profile
 from .providers import Provider, ProviderConfig, ProviderResponse
 from .providers.deepseek import DeepSeekProvider, MockDeepSeekProvider
 from .providers.ollama import OllamaProvider
@@ -708,7 +708,7 @@ async def call_provider(normalized: NormalizedRequest, route: RouteSelection) ->
         if provider_name in SETTINGS.denied_providers:
             route.attempts.append({"provider": provider_name, "status": "blocked", "error": "denylisted"})
             raise ProviderConfigurationError(f"provider {provider_name!r} is denied by configuration")
-        selected_model = route.model or role_model_for_request(config, normalized) or default_model_for_request(config, normalized)
+        selected_model = role_model_for_request(config, normalized) or route.model or default_model_for_request(config, normalized)
         try:
             provider = build_provider(config)
             if budget_hard_stop_for_request(normalized, config, selected_model):
@@ -1365,19 +1365,24 @@ async def get_config() -> dict[str, Any]:
     }
 
 
-def installed_delegation_profile_for_config() -> str:
-    root = Path(os.getenv("CODEX_HOME", "~/.codex")).expanduser()
+def installed_delegation_profile_for_config() -> str | None:
+    root = SETTINGS.codex_home
+    if root is None:
+        raw_root = os.getenv("CODEX_HOME")
+        if not raw_root:
+            return None
+        root = Path(raw_root).expanduser()
     manifest_path = root / ".subagent-router-manifest.json"
     if not manifest_path.exists():
-        return DEFAULT_PROFILE
+        return None
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         profile = manifest.get("delegation_profile")
         if isinstance(profile, str):
             return normalize_profile(profile)
     except (OSError, ValueError, json.JSONDecodeError):
-        return DEFAULT_PROFILE
-    return DEFAULT_PROFILE
+        return None
+    return None
 
 
 @app.patch("/v1/config")

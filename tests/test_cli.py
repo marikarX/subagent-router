@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 from unittest.mock import Mock
 
+import httpx
+
 from subagent_router import cli
 from subagent_router.activation import normalize_profile
 from subagent_router.settings import Settings
@@ -31,6 +33,17 @@ class CliTests(unittest.TestCase):
         self.assertIn("providers", paths)
         self.assertIn("delegation_profile", paths)
         self.assertEqual(paths["delegation_profile"], "cost-optimization")
+
+    def test_paths_uses_explicit_codex_home_for_delegation_profile(self):
+        with tempfile.TemporaryDirectory() as state_dir, tempfile.TemporaryDirectory() as codex_home:
+            self.assertEqual(cli.main(["init", "--codex-home", codex_home, "--profile", "orchestrator"]), 0)
+            stream = io.StringIO()
+
+            with redirect_stdout(stream):
+                result = cli.main(["paths", "--state-dir", state_dir, "--codex-home", codex_home, "--json"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(stream.getvalue())["delegation_profile"], "orchestrator")
 
     def test_doctor_succeeds_in_mock_mode_without_api_key(self):
         with tempfile.TemporaryDirectory() as state_dir:
@@ -599,6 +612,14 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertIn("orchestrator", stream.getvalue())
+
+    def test_patch_remote_config_http_raises_with_response_body(self):
+        request = httpx.Request("PATCH", "http://127.0.0.1:8787/v1/config")
+        response = httpx.Response(500, request=request, text="update failed")
+
+        with patch("subagent_router.cli.httpx.patch", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "500 Internal Server Error: update failed"):
+                cli.patch_remote_config_http("http://127.0.0.1:8787", {"budget_mode": "hard-stop"})
 
     def test_switch_delegation_profile_runs_default_init(self):
         with tempfile.TemporaryDirectory() as codex_home:

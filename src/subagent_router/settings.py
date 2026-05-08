@@ -358,6 +358,7 @@ class Settings:
     # Server configuration.
     host: str = "127.0.0.1"
     port: int = 8787
+    codex_home: Path | None = None
 
     # Resolved paths.
     state_dir: Path = Path()
@@ -445,6 +446,7 @@ class Settings:
             trace_enabled=_env_value(source, "SUBAGENT_ROUTER_TRACE", "CODEX_PROXY_TRACE") == "1",
             host=_env_value(source, "SUBAGENT_ROUTER_HOST", "CODEX_PROXY_HOST", "127.0.0.1") or "127.0.0.1",
             port=int(_env_value(source, "SUBAGENT_ROUTER_PORT", "CODEX_PROXY_PORT", "8787") or "8787"),
+            codex_home=Path(source["CODEX_HOME"]).expanduser().resolve() if source.get("CODEX_HOME") else None,
             provider=str(provider),
             fallback_providers=fallback_providers,
             routing_policies=routing_policies,
@@ -655,6 +657,8 @@ class Settings:
             "SUBAGENT_ROUTER_PROVIDER_DENYLIST": ",".join(self.denied_providers),
             "SUBAGENT_ROUTER_DRY_RUN": "1" if self.dry_run else "0",
         }
+        if self.codex_home is not None:
+            env["CODEX_HOME"] = str(self.codex_home)
         if self.max_cost_per_task is not None:
             env["SUBAGENT_ROUTER_MAX_COST_PER_TASK"] = str(self.max_cost_per_task)
         if self.max_tokens_per_task is not None:

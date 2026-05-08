@@ -108,7 +108,23 @@ class AppTests(unittest.TestCase):
         response = TestClient(proxy_app.app).get("/v1/config")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["delegation_profile"], "cost-optimization")
+        self.assertIsNone(response.json()["delegation_profile"])
+
+    def test_config_endpoint_uses_settings_codex_home_for_delegation_profile(self):
+        from fastapi.testclient import TestClient
+
+        codex_home = Path(self.tempdir.name) / "codex-home"
+        codex_home.mkdir()
+        (codex_home / ".subagent-router-manifest.json").write_text(
+            json.dumps({"delegation_profile": "orchestrator"}),
+            encoding="utf-8",
+        )
+        proxy_app.SETTINGS = replace(proxy_app.SETTINGS, codex_home=codex_home)
+
+        response = TestClient(proxy_app.app).get("/v1/config")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["delegation_profile"], "orchestrator")
 
     def test_empty_chat_completion_output_is_rejected(self):
         payload = {"model": "deepseek-chat", "stream": False, "input": "hello", "tools": []}
@@ -563,6 +579,49 @@ class AppTests(unittest.TestCase):
                 "deepseek-v4-flash",
             )
         )
+
+    def test_call_provider_prefers_explorer_role_model_over_policy_model(self):
+        from fastapi.testclient import TestClient
+
+        class CaptureProvider:
+            async def chat(self, normalized, model):
+                return proxy_app.ProviderResponse(
+                    provider="deepseek",
+                    model=model,
+                    provider_kind="cloud",
+                    chat_response={
+                        "choices": [{"message": {"role": "assistant", "content": "explored"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    },
+                    latency_ms=1,
+                    estimated_usage=False,
+                )
+
+        original_build_provider = proxy_app.build_provider
+        proxy_app.SETTINGS.providers["deepseek"] = replace(
+            proxy_app.SETTINGS.providers["deepseek"],
+            model="default-model",
+            explorer_model="cheap-explorer",
+            worker_model="worker-model",
+        )
+        proxy_app.SETTINGS.provider = "deepseek"
+        proxy_app.build_provider = lambda config: CaptureProvider()
+        try:
+            response = TestClient(proxy_app.app).post(
+                "/v1/responses",
+                json={
+                    "model": "subagent-router-explorer",
+                    "stream": False,
+                    "input": "map this repo",
+                    "tools": [],
+                    "metadata": {"routing_policy": "safe-default"},
+                },
+            )
+        finally:
+            proxy_app.build_provider = original_build_provider
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["metadata"]["provider_model"], "cheap-explorer")
 
     def test_max_spend_aliases_are_enforced(self):
         proxy_app.SETTINGS.budget_mode = "hard-stop"

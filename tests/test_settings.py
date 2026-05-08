@@ -105,6 +105,13 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(env["DEEPSEEK_BASE_URL"], "http://localhost:9000/v1")
         self.assertIn("SUBAGENT_ROUTER_STATE_DIR", env)
 
+    def test_codex_home_round_trips_through_settings_env(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            settings = Settings.from_env({"CODEX_HOME": codex_home})
+
+        self.assertEqual(settings.codex_home, Path(codex_home).resolve())
+        self.assertEqual(settings.as_env()["CODEX_HOME"], str(Path(codex_home).resolve()))
+
     def test_legacy_codex_proxy_env_aliases_still_work(self):
         with tempfile.TemporaryDirectory() as state_dir:
             settings = Settings.from_env(

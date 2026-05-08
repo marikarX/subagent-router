@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Sequence
 from urllib.request import urlopen
 
+import httpx
+
 from .activation import (
     CANONICAL_PROFILES,
     DEFAULT_PROFILE,
@@ -137,7 +139,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     tui = subcommands.add_parser("tui", help="print a compact terminal status view")
     add_common_settings_args(tui)
-    tui.add_argument("--codex-home", default=os.getenv("CODEX_HOME", "~/.codex"))
     tui.add_argument("--watch", action="store_true", help="continuously refresh status every 2 seconds")
     tui.set_defaults(handler=cmd_tui)
 
@@ -205,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
 def add_common_settings_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--codex-home", default=None)
     parser.add_argument("--state-dir", default=None)
     parser.add_argument("--log-dir", default=None)
     parser.add_argument("--activity-file", default=None)
@@ -246,6 +248,7 @@ def settings_from_args(args: argparse.Namespace, *, ephemeral_port: bool = False
         "SUBAGENT_ROUTER_PROVIDER_ERROR_LOG_DIR": args.provider_error_log_dir,
         "SUBAGENT_ROUTER_AUDIT_LOG_FILE": args.audit_log_file,
         "SUBAGENT_ROUTER_USAGE_FILE": args.usage_file,
+        "CODEX_HOME": getattr(args, "codex_home", None),
         "SUBAGENT_ROUTER_PROVIDER": args.provider,
         "SUBAGENT_ROUTER_FALLBACK_PROVIDERS": args.fallback_providers,
         "DEEPSEEK_BASE_URL": args.deepseek_base_url,
@@ -324,7 +327,7 @@ def cmd_restart(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     pid = read_pid(settings)
-    profile = installed_delegation_profile()
+    profile = installed_delegation_profile(settings.codex_home)
     if pid is None:
         print("Subagent Router is not running.")
         print(f"Delegation Profile: {profile}")
@@ -491,6 +494,18 @@ def process_handoff_files(settings: Settings, input_dir: Path, output_dir: Path)
     return count
 
 
+def patch_remote_config_http(base_url: str, updates: dict) -> None:
+    response = httpx.patch(f"{base_url}/v1/config", json=updates, timeout=2.0)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        body = response.text.strip()
+        detail = f"{response.status_code} {response.reason_phrase}"
+        if body:
+            detail = f"{detail}: {body}"
+        raise RuntimeError(detail) from exc
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     from rich.console import Console
     from rich.live import Live
@@ -503,7 +518,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     console = Console()
     base_url = f"http://{settings.host}:{settings.port}"
-    codex_home = Path(args.codex_home).expanduser().resolve()
+    codex_home = Path(args.codex_home or os.getenv("CODEX_HOME", "~/.codex")).expanduser().resolve()
     proxy_url = f"{base_url}/v1"
 
     def get_remote_config():
@@ -517,10 +532,10 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
     def patch_remote_config(updates):
         try:
-            httpx.patch(f"{base_url}/v1/config", json=updates, timeout=2.0)
-            return True
-        except Exception:
-            return False
+            patch_remote_config_http(base_url, updates)
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
 
     def post_remote_reset():
         try:
@@ -557,7 +572,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
                 "provider_roles": {pname: {"reviewer": new_model}},
                 "routing_policies": {"cheap-review": {"model": None}}
             })
-        return False
+        return False, "unknown model role"
 
     def _agent_type_from_entry(entry):
         agent_type = entry.get("agent_type")
@@ -1285,10 +1300,14 @@ def cmd_tui(args: argparse.Namespace) -> int:
                         elif ch == 'm':
                             cur = (state.last_config.get("budget_mode") if state.last_config else settings.budget_mode)
                             new_mode = "hard-stop" if cur == "warn" else "warn"
-                            if patch_remote_config({"budget_mode": new_mode}):
+                            ok, error = patch_remote_config({"budget_mode": new_mode})
+                            if ok:
                                 state.last_config = get_remote_config()
                                 state.message = f"[green]Mode → {new_mode}[/green]"
                                 state.message_expiry = now + 2
+                            else:
+                                state.message = f"[red]Failed to update: {error}[/red]"
+                                state.message_expiry = now + 3
                         elif ch == 'x':
                             # Reset all config overrides (models and roles)
                             updates = {
@@ -1298,12 +1317,13 @@ def cmd_tui(args: argparse.Namespace) -> int:
                                     "cheap-review": {"provider": None, "model": None}
                                 }
                             }
-                            if patch_remote_config(updates):
+                            ok, error = patch_remote_config(updates)
+                            if ok:
                                 state.last_config = get_remote_config()
                                 state.message = "[green]Configuration overrides cleared.[/green]"
                                 state.message_expiry = now + 3
                             else:
-                                state.message = "[red]Failed to reset config[/red]"
+                                state.message = f"[red]Failed to reset config: {error}[/red]"
                                 state.message_expiry = now + 3
 
                     elif state.menu == "model_role":
@@ -1335,7 +1355,8 @@ def cmd_tui(args: argparse.Namespace) -> int:
                         providers = sorted(state.last_config.get("providers", {}).keys()) if state.last_config else ["deepseek", "groq", "ollama"]
                         if ch.isdigit() and 1 <= int(ch) <= len(providers):
                             new_p = providers[int(ch) - 1]
-                            if patch_remote_config({"provider": new_p}):
+                            ok, error = patch_remote_config({"provider": new_p})
+                            if ok:
                                 state.last_config = get_remote_config()
                                 state.message = f"[green]Provider → {new_p}[/green] [dim](checking health...)[/dim]"
                                 state.message_expiry = now + 5
@@ -1352,6 +1373,9 @@ def cmd_tui(args: argparse.Namespace) -> int:
                                     state.needs_update = True
 
                                 Thread(target=check_new_p, args=(new_p,), daemon=True).start()
+                            else:
+                                state.message = f"[red]Failed to update provider: {error}[/red]"
+                                state.message_expiry = now + 3
                         state.menu = "main"
 
                     elif state.menu == "profile":
@@ -1372,10 +1396,14 @@ def cmd_tui(args: argparse.Namespace) -> int:
                         if ch.isdigit() and 1 <= int(ch) <= len(state.model_menu_options):
                             new_model = state.model_menu_options[int(ch) - 1]
                             pname = state.model_menu_provider
-                            if apply_model_assignment(pname, new_model, state.model_menu_role):
+                            ok, error = apply_model_assignment(pname, new_model, state.model_menu_role)
+                            if ok:
                                 state.last_config = get_remote_config()
                                 state.message = f"[green]{state.model_menu_role} model → {new_model}[/green]"
                                 state.message_expiry = now + 2
+                            else:
+                                state.message = f"[red]Failed to update model: {error}[/red]"
+                                state.message_expiry = now + 3
                             state.menu = "main"
                         elif ch == 'm':
                             state.menu = "model_input"
@@ -1390,10 +1418,14 @@ def cmd_tui(args: argparse.Namespace) -> int:
                             if state.model_input:
                                 pname = state.model_menu_provider
                                 new_model = state.model_input
-                                if apply_model_assignment(pname, new_model, state.model_menu_role):
+                                ok, error = apply_model_assignment(pname, new_model, state.model_menu_role)
+                                if ok:
                                     state.last_config = get_remote_config()
                                     state.message = f"[green]{state.model_menu_role} model → {new_model}[/green]"
                                     state.message_expiry = now + 2
+                                else:
+                                    state.message = f"[red]Failed to update model: {error}[/red]"
+                                    state.message_expiry = now + 3
                             state.menu = "main"
                         elif choice == '\x1b':  # escape
                             state.menu = "model"
@@ -1429,13 +1461,14 @@ def cmd_tui(args: argparse.Namespace) -> int:
                                             ftype = ft
                                             break
                                     val = float(state.budget_input) if ftype == "float" else int(state.budget_input)
-                                    if patch_remote_config({state.budget_field_key: val}):
+                                    ok, error = patch_remote_config({state.budget_field_key: val})
+                                    if ok:
                                         state.last_config = get_remote_config()
                                         state.message = f"[green]{state.budget_field} → {val}[/green]"
                                         state.message_expiry = now + 2
                                     else:
-                                        state.message = "[red]Failed to update (server unreachable)[/red]"
-                                        state.message_expiry = now + 2
+                                        state.message = f"[red]Failed to update: {error}[/red]"
+                                        state.message_expiry = now + 3
                                 except ValueError:
                                     state.message = "[red]Invalid number[/red]"
                                     state.message_expiry = now + 2
@@ -1511,13 +1544,14 @@ def cmd_tui(args: argparse.Namespace) -> int:
                                             state.cost_provider: pricing_data
                                         }
                                     }
-                                    if patch_remote_config(updates):
+                                    ok, error = patch_remote_config(updates)
+                                    if ok:
                                         state.last_config = get_remote_config()
                                         state.message = f"[green]Updated {state.cost_provider} {state.cost_field} → {val}[/green]"
                                         state.message_expiry = now + 3
                                     else:
-                                        state.message = "[red]Failed to update (server unreachable)[/red]"
-                                        state.message_expiry = now + 2
+                                        state.message = f"[red]Failed to update: {error}[/red]"
+                                        state.message_expiry = now + 3
                                 except ValueError:
                                     state.message = "[red]Invalid number[/red]"
                                     state.message_expiry = now + 2
@@ -1683,7 +1717,7 @@ def stop_background(settings: Settings, *, timeout: float, force: bool, quiet: b
 
 def cmd_paths(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
-    delegation_profile = installed_delegation_profile()
+    delegation_profile = installed_delegation_profile(settings.codex_home)
     if args.json:
         print(json.dumps({
             **settings.sanitized_paths(),
@@ -1772,7 +1806,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "healthy": True,
             "issues": issues,
             "provider": settings.provider,
-            "delegation_profile": installed_delegation_profile(),
+            "delegation_profile": installed_delegation_profile(settings.codex_home),
         }))
     return 0
 
