@@ -193,6 +193,9 @@ def _provider_configs(source: Mapping[str, str], file_config: dict[str, Any]) ->
                 enabled=_bool_value(raw.get("enabled"), True),
                 timeout_seconds=_float_value(raw.get("timeout_seconds"), capabilities.timeout_seconds),
                 send_parallel_tool_calls=_bool_value(raw.get("send_parallel_tool_calls"), False),
+                explorer_model=str(raw["explorer_model"]) if raw.get("explorer_model") else None,
+                worker_model=str(raw["worker_model"]) if raw.get("worker_model") else None,
+                reviewer_model=str(raw["reviewer_model"]) if raw.get("reviewer_model") else None,
             )
 
     deepseek_block = provider_blocks.get("deepseek", {}) if isinstance(provider_blocks, dict) else {}
@@ -234,6 +237,9 @@ def _provider_configs(source: Mapping[str, str], file_config: dict[str, Any]) ->
         enabled=_bool_value(deepseek_block.get("enabled"), True),
         timeout_seconds=_float_value(deepseek_block.get("timeout_seconds") or _config_value(file_config, "deepseek.timeout_seconds")),
         send_parallel_tool_calls=source.get("DEEPSEEK_SEND_PARALLEL_TOOL_CALLS") == "1" or _bool_value(deepseek_block.get("send_parallel_tool_calls"), False),
+        explorer_model=str(deepseek_block["explorer_model"]) if deepseek_block.get("explorer_model") else None,
+        worker_model=str(deepseek_block["worker_model"]) if deepseek_block.get("worker_model") else None,
+        reviewer_model=str(deepseek_block["reviewer_model"]) if deepseek_block.get("reviewer_model") else None,
     )
 
     if "openai-compatible" not in providers:
@@ -535,7 +541,9 @@ class Settings:
                                 new_providers[pname] = replace(new_providers[pname], model=pdata["model"], capabilities=cap, **mp_kwargs)
                             else:
                                 new_providers[pname] = replace(new_providers[pname], capabilities=cap, **mp_kwargs)
-                                
+
+                            if "explorer_model" in pdata:
+                                new_providers[pname] = replace(new_providers[pname], explorer_model=pdata["explorer_model"])
                             if "worker_model" in pdata:
                                 new_providers[pname] = replace(new_providers[pname], worker_model=pdata["worker_model"])
                             if "reviewer_model" in pdata:
@@ -591,6 +599,8 @@ class Settings:
                 } for mname, rates in p.model_pricing.items()
             },
         }
+        if p.explorer_model is not None:
+            entry["explorer_model"] = p.explorer_model
         if p.worker_model is not None:
             entry["worker_model"] = p.worker_model
         if p.reviewer_model is not None:

@@ -12,6 +12,7 @@ from unittest.mock import patch
 from unittest.mock import Mock
 
 from subagent_router import cli
+from subagent_router.activation import normalize_profile
 from subagent_router.settings import Settings
 
 
@@ -28,6 +29,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(paths["state_dir"], str(Path(state_dir).resolve()))
         self.assertEqual(paths["activity_file"], str(Path(state_dir).resolve() / "logs" / "activity.json"))
         self.assertIn("providers", paths)
+        self.assertIn("delegation_profile", paths)
+        self.assertEqual(paths["delegation_profile"], "cost-optimization")
 
     def test_doctor_succeeds_in_mock_mode_without_api_key(self):
         with tempfile.TemporaryDirectory() as state_dir:
@@ -63,18 +66,138 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result, 0)
             instructions = (root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").read_text()
             self.assertIn("standing user authorization", instructions)
-            self.assertIn("Read every instruction file path listed in the active `AGENTS.md`", instructions)
+            self.assertIn("Active profile: cost-optimization", instructions)
+            self.assertIn("minimize parent Codex/GPT-5.5 token usage", instructions)
             self.assertEqual(
                 (root / "AGENTS.md").read_text().splitlines()[0],
                 f"Follow instructions in {(root / 'SUBAGENT_ROUTER_INSTRUCTIONS.md').resolve()}",
             )
             self.assertFalse((root / "skills" / "deepseek" / "SKILL.md").exists())
             self.assertFalse((root / "slash_commands" / "deepseek.md").exists())
+            self.assertIn("subagent_router_explorer", (root / "agents" / "subagent-router-explorer.toml").read_text())
             self.assertIn("subagent_router_worker", (root / "agents" / "subagent-router-worker.toml").read_text())
             self.assertIn("subagent_router_reviewer", (root / "agents" / "subagent-router-reviewer.toml").read_text())
             config = (root / "config.toml").read_text()
             self.assertIn("[model_providers.subagent_router]", config)
             self.assertIn('base_url = "http://127.0.0.1:9999/v1"', config)
+
+    def test_profile_normalization_accepts_canonical_values_and_aliases(self):
+        self.assertEqual(normalize_profile(None), "cost-optimization")
+        self.assertEqual(normalize_profile("cost"), "cost-optimization")
+        self.assertEqual(normalize_profile("cost-optimized"), "cost-optimization")
+        self.assertEqual(normalize_profile("budget"), "cost-optimization")
+        self.assertEqual(normalize_profile("budget-optimized"), "cost-optimization")
+        self.assertEqual(normalize_profile("token-saving"), "cost-optimization")
+        self.assertEqual(normalize_profile("token-optimized"), "cost-optimization")
+        self.assertEqual(normalize_profile("deep"), "deep-delegation")
+        self.assertEqual(normalize_profile("deep-delegate"), "deep-delegation")
+        self.assertEqual(normalize_profile("deep-delegation"), "deep-delegation")
+        self.assertEqual(normalize_profile("aggressive"), "deep-delegation")
+        self.assertEqual(normalize_profile("aggressive-delegation"), "deep-delegation")
+        self.assertEqual(normalize_profile("quality"), "orchestrator")
+        self.assertEqual(normalize_profile("conservative"), "orchestrator")
+        self.assertEqual(normalize_profile("codex-control"), "orchestrator")
+        self.assertEqual(normalize_profile("orchestrator"), "orchestrator")
+        self.assertEqual(normalize_profile("manual"), "manual")
+        self.assertEqual(normalize_profile("opt-in"), "manual")
+        self.assertEqual(normalize_profile("provider-only"), "manual")
+
+    def test_init_explicit_cost_optimization_profile_installs_cost_instructions(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "cost-optimization"])
+
+            root = Path(codex_home)
+            self.assertEqual(result, 0)
+            instructions = (root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").read_text(encoding="utf-8")
+            self.assertIn("Active profile: cost-optimization", instructions)
+            self.assertIn("Retry and continuation caps", instructions)
+            self.assertIn("These limits apply regardless of", instructions)
+            self.assertIn("Parent hard-stop triggers", instructions)
+            self.assertIn("tests fail or hang after delegated implementation", instructions)
+            self.assertIn("patch source or test logic", instructions)
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "cost-optimization")
+
+    def test_init_explicit_deep_delegation_profile_installs_deep_instructions(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "deep-delegation"])
+
+            root = Path(codex_home)
+            self.assertEqual(result, 0)
+            instructions = (root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").read_text(encoding="utf-8")
+            self.assertIn("Active profile: deep-delegation", instructions)
+            self.assertIn("maximize offload", instructions)
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "deep-delegation")
+
+    def test_init_explicit_orchestrator_profile_installs_orchestrator_instructions(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "orchestrator"])
+
+            root = Path(codex_home)
+            self.assertEqual(result, 0)
+            instructions = (root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").read_text(encoding="utf-8")
+            self.assertIn("Active profile: orchestrator", instructions)
+            self.assertIn("primary orchestrator", instructions)
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "orchestrator")
+
+    def test_init_explicit_manual_profile_skips_global_instructions(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "manual"])
+
+            root = Path(codex_home)
+            self.assertEqual(result, 0)
+            self.assertFalse((root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").exists())
+            self.assertFalse((root / "AGENTS.md").exists())
+            self.assertTrue((root / "agents" / "subagent-router-explorer.toml").exists())
+            self.assertTrue((root / "agents" / "subagent-router-worker.toml").exists())
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "manual")
+            self.assertNotIn("SUBAGENT_ROUTER_INSTRUCTIONS.md", manifest.get("files", {}))
+
+    def test_init_manual_profile_removes_managed_global_instructions(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            self.assertEqual(cli.main(["init", "--codex-home", codex_home, "--profile", "cost-optimization"]), 0)
+            self.assertTrue((root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").exists())
+
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "manual"])
+
+            self.assertEqual(result, 0)
+            self.assertFalse((root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").exists())
+            self.assertFalse((root / "AGENTS.md").read_text(encoding="utf-8").strip())
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "manual")
+
+    def test_installed_agent_templates_include_required_output_contracts(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            result = cli.main(["init", "--codex-home", codex_home])
+
+            self.assertEqual(result, 0)
+            explorer = (root / "agents" / "subagent-router-explorer.toml").read_text(encoding="utf-8")
+            worker = (root / "agents" / "subagent-router-worker.toml").read_text(encoding="utf-8")
+            reviewer = (root / "agents" / "subagent-router-reviewer.toml").read_text(encoding="utf-8")
+            self.assertIn('model = "subagent-router-explorer"', explorer)
+            self.assertIn("RECOMMENDED_NEXT_AGENT: explorer|worker|reviewer|none", explorer)
+            self.assertIn('model = "subagent-router-worker"', worker)
+            self.assertIn("FILES_CHANGED:", worker)
+            self.assertIn("NEEDS_PARENT_ACTION: yes|no", worker)
+            self.assertIn('model = "subagent-router-reviewer"', reviewer)
+            self.assertIn("NO_FINDINGS: true|false", reviewer)
+
+    def test_init_invalid_profile_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            stream = io.StringIO()
+            with redirect_stderr(stream):
+                result = cli.main(["init", "--codex-home", codex_home, "--profile", "reckless"])
+
+        self.assertEqual(result, 2)
+        self.assertIn("invalid delegation profile", stream.getvalue())
+        self.assertIn("cost-optimization", stream.getvalue())
+        self.assertIn("deep-delegation", stream.getvalue())
+        self.assertIn("orchestrator", stream.getvalue())
 
     def test_init_default_preserves_existing_agents_content_below_router_path(self):
         with tempfile.TemporaryDirectory() as codex_home:
@@ -107,7 +230,7 @@ class CliTests(unittest.TestCase):
 
     def test_init_opt_in_installs_skill_and_slash_without_global_instructions(self):
         with tempfile.TemporaryDirectory() as codex_home:
-            result = cli.main(["init", "--mode", "opt-in", "--codex-home", codex_home])
+            result = cli.main(["init", "--mode", "opt-in", "--codex-home", codex_home, "--profile", "orchestrator"])
 
             root = Path(codex_home)
             self.assertEqual(result, 0)
@@ -115,10 +238,11 @@ class CliTests(unittest.TestCase):
             self.assertFalse((root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").exists())
             self.assertIn("Use this skill only", (root / "skills" / "deepseek" / "SKILL.md").read_text())
             self.assertIn("$deepseek {args}", (root / "slash_commands" / "deepseek.md").read_text())
+            self.assertTrue((root / "agents" / "subagent-router-explorer.toml").exists())
 
     def test_init_provider_only_skips_global_and_opt_in_activation(self):
         with tempfile.TemporaryDirectory() as codex_home:
-            result = cli.main(["init", "--mode", "provider-only", "--codex-home", codex_home])
+            result = cli.main(["init", "--mode", "provider-only", "--codex-home", codex_home, "--profile", "cost"])
 
             root = Path(codex_home)
             self.assertEqual(result, 0)
@@ -126,7 +250,24 @@ class CliTests(unittest.TestCase):
             self.assertFalse((root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").exists())
             self.assertFalse((root / "skills" / "deepseek" / "SKILL.md").exists())
             self.assertFalse((root / "slash_commands" / "deepseek.md").exists())
+            self.assertTrue((root / "agents" / "subagent-router-explorer.toml").exists())
             self.assertTrue((root / "agents" / "subagent-router-worker.toml").exists())
+
+    def test_init_opt_in_with_profile_warns_on_stderr(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                result = cli.main(["init", "--mode", "opt-in", "--codex-home", codex_home, "--profile", "orchestrator"])
+            self.assertEqual(result, 0)
+            self.assertIn("--profile is ignored with --mode opt-in", stderr.getvalue())
+
+    def test_init_provider_only_with_profile_warns_on_stderr(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                result = cli.main(["init", "--mode", "provider-only", "--codex-home", codex_home, "--profile", "cost"])
+            self.assertEqual(result, 0)
+            self.assertIn("--profile is ignored with --mode provider-only", stderr.getvalue())
 
     def test_init_does_not_overwrite_existing_activation_without_force(self):
         with tempfile.TemporaryDirectory() as codex_home:
@@ -162,6 +303,20 @@ class CliTests(unittest.TestCase):
         self.assertIn("subagent-router restart", help_text)
         self.assertIn("subagent-router stop", help_text)
         self.assertIn("subagent-router version", help_text)
+
+    def test_init_help_lists_profile_option(self):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main(["init", "--help"])
+
+        self.assertEqual(ctx.exception.code, 0)
+        help_text = stream.getvalue()
+        self.assertIn("--profile", help_text)
+        self.assertIn("cost-optimization", help_text)
+        self.assertIn("deep-delegation", help_text)
+        self.assertIn("orchestrator", help_text)
+        self.assertIn("manual", help_text)
 
     def test_version_command_prints_package_version(self):
         stream = io.StringIO()
@@ -312,6 +467,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("pid 12345", stream.getvalue())
         self.assertIn("http://127.0.0.1:9999/v1", stream.getvalue())
+        self.assertIn("Delegation Profile", stream.getvalue())
+        self.assertIn("cost-optimization", stream.getvalue())
 
     @patch("subagent_router.cli.process_running", return_value=False)
     def test_status_removes_stale_pid(self, mock_running):
@@ -326,6 +483,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertFalse(pid_path.exists())
             self.assertIn("removed stale pid 12345", stream.getvalue())
+            self.assertIn("Delegation Profile", stream.getvalue())
 
     def test_status_reports_missing_pid(self):
         with tempfile.TemporaryDirectory() as state_dir:
@@ -336,6 +494,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result, 1)
         self.assertIn("not running", stream.getvalue())
+        self.assertIn("Delegation Profile", stream.getvalue())
 
     def test_logs_reports_missing_log_file(self):
         with tempfile.TemporaryDirectory() as state_dir:
@@ -427,6 +586,82 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertIn("Subagent Router", stream.getvalue())
+        self.assertIn("Profile", stream.getvalue())
+        self.assertIn("[D] Profile", stream.getvalue())
+
+    def test_tui_uses_codex_home_for_installed_profile(self):
+        with tempfile.TemporaryDirectory() as state_dir, tempfile.TemporaryDirectory() as codex_home:
+            self.assertEqual(cli.main(["init", "--codex-home", codex_home, "--profile", "orchestrator"]), 0)
+            stream = io.StringIO()
+
+            with redirect_stdout(stream):
+                result = cli.main(["tui", "--state-dir", state_dir, "--codex-home", codex_home, "--mock"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("orchestrator", stream.getvalue())
+
+    def test_switch_delegation_profile_runs_default_init(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            self.assertEqual(cli.main(["init", "--codex-home", codex_home, "--profile", "cost-optimization"]), 0)
+
+            switched, profile, error = cli._switch_delegation_profile(
+                root,
+                "http://127.0.0.1:8787/v1",
+                "orchestrator",
+                force=False,
+            )
+
+            self.assertTrue(switched)
+            self.assertEqual(profile, "orchestrator")
+            self.assertIsNone(error)
+            self.assertIn("Active profile: orchestrator", (root / "SUBAGENT_ROUTER_INSTRUCTIONS.md").read_text(encoding="utf-8"))
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "orchestrator")
+
+    def test_tui_profile_switch_force_overwrites_custom_instructions(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            self.assertEqual(cli.main(["init", "--codex-home", codex_home, "--profile", "cost-optimization"]), 0)
+            instruction_path = root / "SUBAGENT_ROUTER_INSTRUCTIONS.md"
+            instruction_path.write_text("# Custom profile instructions\n", encoding="utf-8")
+
+            switched, profile, error = cli._switch_delegation_profile(
+                root,
+                "http://127.0.0.1:8787/v1",
+                "orchestrator",
+                force=True,
+            )
+
+            self.assertTrue(switched)
+            self.assertEqual(profile, "orchestrator")
+            self.assertIsNone(error)
+            text = instruction_path.read_text(encoding="utf-8")
+            self.assertIn("Active profile: orchestrator", text)
+            self.assertNotIn("# Custom profile instructions", text)
+
+    def test_switch_delegation_profile_preserves_custom_instructions_without_force(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            self.assertEqual(cli.main(["init", "--codex-home", codex_home, "--profile", "cost-optimization"]), 0)
+            instruction_path = root / "SUBAGENT_ROUTER_INSTRUCTIONS.md"
+            custom_text = "# Custom profile instructions\n"
+            instruction_path.write_text(custom_text, encoding="utf-8")
+
+            switched, profile, error = cli._switch_delegation_profile(
+                root,
+                "http://127.0.0.1:8787/v1",
+                "orchestrator",
+                force=False,
+            )
+
+            self.assertFalse(switched)
+            self.assertEqual(profile, "orchestrator")
+            self.assertIsNone(error)
+            text = instruction_path.read_text(encoding="utf-8")
+            self.assertEqual(text, custom_text)
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "cost-optimization")
 
     def test_tui_with_watch_refreshes_until_interrupt(self):
         with tempfile.TemporaryDirectory() as state_dir:
@@ -512,6 +747,40 @@ class CliTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertIn("ERR", output)
         self.assertIn("read timeout", output)
+
+    def test_tui_extracts_provider_error_message_from_repr_payload(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            logs_dir = Path(state_dir) / "logs"
+            logs_dir.mkdir(parents=True)
+            (logs_dir / "usage.json").write_text(
+                json.dumps({"daily_usage": {datetime.date.today().isoformat(): {}}}),
+                encoding="utf-8",
+            )
+            audit_path = logs_dir / "audit.jsonl"
+            audit_path.write_text(
+                json.dumps(
+                    {
+                        "timestamp": time.time(),
+                        "status": "error",
+                        "provider": "deepseek",
+                        "model": "deepseek-v4-flash",
+                        "message": "provider rejected request: {'error': {'message': 'insufficient balance', 'type': 'billing'}}",
+                        "estimated_cost_usd": 0.0,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                result = cli.main(["tui", "--state-dir", state_dir])
+
+        self.assertEqual(result, 0)
+        output = stream.getvalue()
+        self.assertIn("ERR", output)
+        self.assertIn("insufficient balance", output)
+        self.assertNotIn("{'error'", output)
 
     def test_tui_does_not_mark_recovery_audit_records_as_errors(self):
         with tempfile.TemporaryDirectory() as state_dir:
@@ -652,6 +921,8 @@ class CliTests(unittest.TestCase):
             self.assertTrue(manifest_path.exists())
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["package_version"], cli._pkg_version_str())
+            self.assertEqual(manifest["delegation_profile"], "cost-optimization")
+            self.assertIn("agents/subagent-router-explorer.toml", manifest["files"])
             self.assertIn("agents/subagent-router-worker.toml", manifest["files"])
             self.assertIn("agents/subagent-router-reviewer.toml", manifest["files"])
             self.assertIn("SUBAGENT_ROUTER_INSTRUCTIONS.md", manifest["files"])
@@ -703,6 +974,73 @@ class CliTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["files"]["agents/subagent-router-worker.toml"]["content_hash"], current_hash)
 
+    def test_init_profile_switch_updates_managed_instruction_file(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "cost-optimization"])
+            self.assertEqual(result, 0)
+            instruction_path = root / "SUBAGENT_ROUTER_INSTRUCTIONS.md"
+            self.assertIn("Active profile: cost-optimization", instruction_path.read_text(encoding="utf-8"))
+
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "orchestrator"])
+            self.assertEqual(result, 0)
+
+            self.assertIn("Active profile: orchestrator", instruction_path.read_text(encoding="utf-8"))
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "orchestrator")
+
+    def test_init_profile_switch_preserves_custom_instruction_file_without_force(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            cli.main(["init", "--codex-home", codex_home, "--profile", "cost-optimization"])
+            instruction_path = root / "SUBAGENT_ROUTER_INSTRUCTIONS.md"
+            instruction_path.write_text("# Custom profile instructions\n", encoding="utf-8")
+
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "orchestrator"])
+            self.assertEqual(result, 0)
+
+            self.assertEqual(instruction_path.read_text(encoding="utf-8"), "# Custom profile instructions\n")
+
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "cost-optimization")
+
+    def test_init_force_overwrites_custom_instruction_file_on_profile_switch(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            cli.main(["init", "--codex-home", codex_home, "--profile", "cost-optimization"])
+            instruction_path = root / "SUBAGENT_ROUTER_INSTRUCTIONS.md"
+            instruction_path.write_text("# Custom profile instructions\n", encoding="utf-8")
+
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "orchestrator", "--force"])
+            self.assertEqual(result, 0)
+
+            text = instruction_path.read_text(encoding="utf-8")
+            self.assertIn("Active profile: orchestrator", text)
+            self.assertNotIn("# Custom profile instructions", text)
+
+    def test_init_adopts_preexisting_cost_optimization_instructions(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            instruction_path = root / "SUBAGENT_ROUTER_INSTRUCTIONS.md"
+            instructions = cli.subagent_router_instructions_for_profile("cost-optimization")
+            instruction_path.parent.mkdir(parents=True, exist_ok=True)
+            instruction_path.write_text(instructions, encoding="utf-8")
+
+            manifest_path = root / ".subagent-router-manifest.json"
+            self.assertFalse(manifest_path.exists())
+
+            result = cli.main(["init", "--codex-home", codex_home, "--profile", "cost-optimization"])
+            self.assertEqual(result, 0)
+
+            self.assertTrue(manifest_path.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "cost-optimization")
+            instructions_entry = manifest.get("files", {}).get("SUBAGENT_ROUTER_INSTRUCTIONS.md")
+            self.assertIsNotNone(instructions_entry)
+            self.assertIn("content_hash", instructions_entry)
+            self.assertIsInstance(instructions_entry["content_hash"], str)
+            self.assertTrue(len(instructions_entry["content_hash"]) > 0)
+
     def test_init_user_modification_preserved_without_force(self):
         with tempfile.TemporaryDirectory() as codex_home:
             result = cli.main(["init", "--codex-home", codex_home, "--proxy-url", "http://127.0.0.1:9999/v1"])
@@ -735,6 +1073,26 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertIn("subagent_router_worker", worker_path.read_text(encoding="utf-8"))
+
+    def test_init_legacy_instructions_adopted_without_manifest(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            root = Path(codex_home)
+            instruction_path = root / "SUBAGENT_ROUTER_INSTRUCTIONS.md"
+            legacy_content = "# legacy custom instructions\n"
+            instruction_path.write_text(legacy_content, encoding="utf-8")
+
+            with patch.dict(
+                cli.LEGACY_MANAGED_HASHES,
+                {"SUBAGENT_ROUTER_INSTRUCTIONS.md": (cli._hash_content(legacy_content),)},
+                clear=True,
+            ):
+                result = cli.main(["init", "--codex-home", codex_home])
+
+            self.assertEqual(result, 0)
+            updated = instruction_path.read_text(encoding="utf-8")
+            self.assertIn("Active profile: cost-optimization", updated)
+            manifest = json.loads((root / ".subagent-router-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["delegation_profile"], "cost-optimization")
 
     def test_init_force_overwrites_user_modifications(self):
         with tempfile.TemporaryDirectory() as codex_home:

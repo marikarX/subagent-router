@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import os
 import re
 import threading
 import time
@@ -28,6 +29,7 @@ from .normalization import (
     normalize_request,
     redact,
 )
+from .activation import DEFAULT_PROFILE, normalize_profile
 from .providers import Provider, ProviderConfig, ProviderResponse
 from .providers.deepseek import DeepSeekProvider, MockDeepSeekProvider
 from .providers.ollama import OllamaProvider
@@ -240,6 +242,7 @@ async def create_response(request: Request) -> JSONResponse | StreamingResponse:
             "latency_ms": provider_result.latency_ms,
         }
     ]
+    agent_type = agent_type_for_model(normalized.requested_model) or agent_type_for_model(normalized.model)
     write_usage_record(
         {
             "timestamp": int(time.time()),
@@ -247,6 +250,8 @@ async def create_response(request: Request) -> JSONResponse | StreamingResponse:
             "provider": provider_result.provider,
             "provider_kind": provider_result.provider_kind,
             "model": provider_result.model,
+            "requested_model": normalized.requested_model,
+            "agent_type": agent_type,
             "routing_policy": route.policy,
             "selection_reason": route.reason,
             "usage": usage,
@@ -264,6 +269,8 @@ async def create_response(request: Request) -> JSONResponse | StreamingResponse:
             "provider": provider_result.provider,
             "provider_kind": provider_result.provider_kind,
             "model": provider_result.model,
+            "requested_model": normalized.requested_model,
+            "agent_type": agent_type,
             "routing_policy": route.policy,
             "selection_reason": route.reason,
             "latency_ms": provider_result.latency_ms,
@@ -701,7 +708,7 @@ async def call_provider(normalized: NormalizedRequest, route: RouteSelection) ->
         if provider_name in SETTINGS.denied_providers:
             route.attempts.append({"provider": provider_name, "status": "blocked", "error": "denylisted"})
             raise ProviderConfigurationError(f"provider {provider_name!r} is denied by configuration")
-        selected_model = route.model or default_model_for_request(config, normalized)
+        selected_model = route.model or role_model_for_request(config, normalized) or default_model_for_request(config, normalized)
         try:
             provider = build_provider(config)
             if budget_hard_stop_for_request(normalized, config, selected_model):
@@ -764,6 +771,17 @@ def default_model_for_request(config: ProviderConfig, normalized: NormalizedRequ
     if is_subagent_model(normalized.requested_model) or is_subagent_model(normalized.model):
         return normalized.model
     return config.model or normalized.model
+
+
+def role_model_for_request(config: ProviderConfig, normalized: NormalizedRequest) -> str | None:
+    agent_type = agent_type_for_model(normalized.requested_model) or agent_type_for_model(normalized.model)
+    if agent_type == "explorer" and config.explorer_model:
+        return config.explorer_model
+    if agent_type == "worker" and config.worker_model:
+        return config.worker_model
+    if agent_type == "reviewer" and config.reviewer_model:
+        return config.reviewer_model
+    return None
 
 
 def dry_run_provider_response(normalized: NormalizedRequest, route: RouteSelection) -> ProviderResponse:
@@ -1323,12 +1341,14 @@ async def get_config() -> dict[str, Any]:
             "cached_input_cost_per_million": cached,
             "cost_hint": cfg.capabilities.cost_hint,
             "model": active_model,
+            "explorer_model": cfg.explorer_model,
             "worker_model": cfg.worker_model,
             "reviewer_model": cfg.reviewer_model,
             "model_overrides": overrides,
         }
     return {
         "provider": SETTINGS.provider,
+        "delegation_profile": installed_delegation_profile_for_config(),
         "fallback_providers": SETTINGS.fallback_providers,
         "budget_mode": SETTINGS.budget_mode,
         "max_cost_per_day": SETTINGS.max_cost_per_day,
@@ -1340,9 +1360,24 @@ async def get_config() -> dict[str, Any]:
         "max_cost_per_provider": SETTINGS.max_cost_per_provider,
         "max_tokens_per_provider": SETTINGS.max_tokens_per_provider,
         "provider_pricing": provider_pricing,
-        "providers": {name: {"model": p.model, "worker_model": p.worker_model, "reviewer_model": p.reviewer_model, "enabled": p.enabled} for name, p in SETTINGS.providers.items()},
+        "providers": {name: {"model": p.model, "explorer_model": p.explorer_model, "worker_model": p.worker_model, "reviewer_model": p.reviewer_model, "enabled": p.enabled} for name, p in SETTINGS.providers.items()},
         "routing_policies": SETTINGS.routing_policies,
     }
+
+
+def installed_delegation_profile_for_config() -> str:
+    root = Path(os.getenv("CODEX_HOME", "~/.codex")).expanduser()
+    manifest_path = root / ".subagent-router-manifest.json"
+    if not manifest_path.exists():
+        return DEFAULT_PROFILE
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        profile = manifest.get("delegation_profile")
+        if isinstance(profile, str):
+            return normalize_profile(profile)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return DEFAULT_PROFILE
+    return DEFAULT_PROFILE
 
 
 @app.patch("/v1/config")
@@ -1400,6 +1435,8 @@ async def patch_config(request: Request) -> JSONResponse:
     if "provider_roles" in data:
         for pname, roles in data["provider_roles"].items():
             if pname in new_providers:
+                if "explorer" in roles:
+                    new_providers[pname] = replace(new_providers[pname], explorer_model=roles["explorer"])
                 if "worker" in roles:
                     new_providers[pname] = replace(new_providers[pname], worker_model=roles["worker"])
                 if "reviewer" in roles:
@@ -1784,11 +1821,24 @@ def response_items_from_chat(
     return output, assistant_messages, reasoning_by_call_id
 
 
-_SUBAGENT_MODELS = {k for k in MODEL_ALIASES if k != "deepseek-chat"}
+_SUBAGENT_MODELS = {
+    k
+    for k in MODEL_ALIASES
+    if k not in ("deepseek-chat", "deepseek-v4-flash", "deepseek-v4-pro")
+}
 
 
 def is_subagent_model(model: str) -> bool:
     return model in _SUBAGENT_MODELS or model.startswith("subagent-")
+
+
+def agent_type_for_model(model: str | None) -> str | None:
+    if not model:
+        return None
+    for agent_type in ("explorer", "worker", "reviewer"):
+        if model in (f"subagent-router-{agent_type}", f"deepseek-{agent_type}"):
+            return agent_type
+    return None
 
 
 def subagent_final_lacks_write_evidence(
@@ -1999,7 +2049,35 @@ def log_provider_error(normalized: NormalizedRequest, response: httpx.Response) 
 
 def safe_provider_error(response: httpx.Response) -> str:
     body = sanitize_diagnostic(provider_body(response))
+    message = provider_error_message(body)
+    if message:
+        if diagnostic_contains_redaction(body):
+            return f"provider rejected request: {message} ([REDACTED] details omitted)"
+        return f"provider rejected request: {message}"
     return f"provider rejected request: {body}"
+
+
+def provider_error_message(body: Any) -> str | None:
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if message:
+                return str(message)
+        message = body.get("message")
+        if message:
+            return str(message)
+    return None
+
+
+def diagnostic_contains_redaction(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(diagnostic_contains_redaction(item) for item in value.values())
+    if isinstance(value, list):
+        return any(diagnostic_contains_redaction(item) for item in value)
+    if isinstance(value, str):
+        return "[REDACTED]" in value
+    return False
 
 
 def provider_body(response: httpx.Response) -> Any:

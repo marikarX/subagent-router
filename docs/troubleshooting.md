@@ -81,8 +81,9 @@ The proxy forwards supported function tools only.
 - `exec_command` is preserved.
 - Browser-style tools and unsupported Responses built-ins are dropped.
 - `apply_patch` is dropped for read-only reviewer requests.
-- `apply_patch` is preserved for the `deepseek-worker` alias, write-capable
-  metadata, or `DEEPSEEK_ALLOW_APPLY_PATCH=1`.
+- `apply_patch` is preserved for worker aliases such as
+  `subagent-router-worker` and `deepseek-worker`, write-capable metadata, or
+  `DEEPSEEK_ALLOW_APPLY_PATCH=1`.
 - Write-capable worker aliases keep `apply_patch` by default.
 
 ## Thinking-Mode Continuations

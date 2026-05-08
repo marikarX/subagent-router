@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## [0.2.3] - 2026-05-05
+
+### Added
+
+- Added delegation profiles (`cost-optimization`, `orchestrator`) with
+  canonical names, aliases (e.g. `cost`, `budget`, `quality`, `conservative`,
+  `codex-control`), and `subagent-router init --profile` selection.
+- Added explorer, worker, and reviewer installed role files
+  (`agents/subagent-router-{explorer,worker,reviewer}.toml`) for all
+  init modes and delegation profiles.
+- Added manifest-based delegation profile tracking
+  (`delegation_profile` key in `.subagent-router-manifest.json`) with
+  legacy file hash adoption and content-hash change detection.
+- Added `subagent-router status`, `paths`, `doctor`, and TUI delegation
+  profile display, runtime switching, and `installed_delegation_profile()`
+  query API.
+- Added `--force` flag to `subagent-router init` for overwriting
+  customized activation files.
+- Added rich terminal output dependency for enhanced CLI display.
+
+### Changed
+
+- Bumped Python and npm package versions to `0.2.3`.
+- Updated `subagent-router doctor` and `paths` to report the active
+  delegation profile.
+- Updated TUI dashboard to include delegation profile in the config
+  panel and support interactive profile switching.
+- Updated init default mode to install profile-specific
+  SUBAGENT_ROUTER_INSTRUCTIONS.md and reference it from AGENTS.md.
+- Updated init to preserve user-customized instruction files by default,
+  surfacing a warning when `--force` is required.
+
+### Fixed
+
+- Fixed TUI profile switch to preserve custom SUBAGENT_ROUTER_INSTRUCTIONS.md
+  by default instead of force-overwriting.
+
 ## [0.2.2] - 2026-05-05
 
 ### Added

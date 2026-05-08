@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 from collections import deque
 import hashlib
@@ -22,11 +23,15 @@ from typing import Sequence
 from urllib.request import urlopen
 
 from .activation import (
+    CANONICAL_PROFILES,
+    DEFAULT_PROFILE,
     DEEPSEEK_SKILL,
     DEEPSEEK_SLASH_COMMAND,
+    EXPLORER_AGENT,
     REVIEWER_AGENT,
-    SUBAGENT_ROUTER_SYSTEM_INSTRUCTIONS,
     WORKER_AGENT,
+    normalize_profile,
+    subagent_router_instructions_for_profile,
 )
 from .settings import Settings
 
@@ -36,7 +41,11 @@ PROVIDER_NAME = "Subagent Router"
 CONFIG_MARKER_BEGIN = "# >>> subagent-router >>>"
 CONFIG_MARKER_END = "# <<< subagent-router <<<"
 MANIFEST_FILENAME = ".subagent-router-manifest.json"
-LEGACY_MANAGED_HASHES: dict[str, tuple[str, ...]] = {}
+LEGACY_MANAGED_HASHES: dict[str, tuple[str, ...]] = {
+    "SUBAGENT_ROUTER_INSTRUCTIONS.md": ("3336ea091517b6362249cb926c7f49d76d15d47731d6985ca6ae236df511acd4",),
+    "agents/subagent-router-worker.toml": ("2e99a23c2058cd8791715066385baba61113d39a5cb53abbc792a8cb92d937ac",),
+    "agents/subagent-router-reviewer.toml": ("15ab6ae27eb9944f32afd9b50be70746a4c6838dac65c49942ee6d2d2183f7ba",),
+}
 _CHILD_SECRET_KEYS: frozenset[str] = frozenset({
     "DEEPSEEK_API_KEY",
     "OPENAI_COMPAT_API_KEY",
@@ -128,6 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     tui = subcommands.add_parser("tui", help="print a compact terminal status view")
     add_common_settings_args(tui)
+    tui.add_argument("--codex-home", default=os.getenv("CODEX_HOME", "~/.codex"))
     tui.add_argument("--watch", action="store_true", help="continuously refresh status every 2 seconds")
     tui.set_defaults(handler=cmd_tui)
 
@@ -164,6 +174,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     init.add_argument("--force", action="store_true", help="overwrite managed activation files")
+    init.add_argument(
+        "--profile",
+        default=None,
+        metavar="{cost-optimization,deep-delegation,orchestrator,manual}",
+        help=(
+            "Delegation profile for installed Codex instructions. "
+            "cost-optimization minimizes parent Codex/GPT-5.5 token usage. "
+            "deep-delegation maximizes router offload. "
+            "orchestrator keeps Codex/GPT-5.5 in broader control. "
+            "manual installs no global automatic delegation. "
+            "Only affects --mode default."
+        ),
+    )
     init.set_defaults(handler=cmd_init)
 
     service = subcommands.add_parser("install-service", help="write a systemd user service")
@@ -301,14 +324,18 @@ def cmd_restart(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     pid = read_pid(settings)
+    profile = installed_delegation_profile()
     if pid is None:
         print("Subagent Router is not running.")
+        print(f"Delegation Profile: {profile}")
         return 1
     if not process_running(pid):
         pid_file(settings).unlink(missing_ok=True)
         print(f"Subagent Router is not running (removed stale pid {pid}).")
+        print(f"Delegation Profile: {profile}")
         return 1
     print(f"Subagent Router is running (pid {pid}) at http://{settings.host}:{settings.port}/v1")
+    print(f"Delegation Profile: {profile}")
     return 0
 
 
@@ -476,6 +503,8 @@ def cmd_tui(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
     console = Console()
     base_url = f"http://{settings.host}:{settings.port}"
+    codex_home = Path(args.codex_home).expanduser().resolve()
+    proxy_url = f"{base_url}/v1"
 
     def get_remote_config():
         try:
@@ -518,6 +547,10 @@ def cmd_tui(args: argparse.Namespace) -> int:
                 "provider_roles": {pname: {"worker": new_model}},
                 "routing_policies": {"safe-default": {"model": None}}
             })
+        elif role == "explorer":
+            return patch_remote_config({
+                "provider_roles": {pname: {"explorer": new_model}},
+            })
         elif role == "reviewer":
             # Set provider-specific reviewer model and clear any global override
             return patch_remote_config({
@@ -525,6 +558,47 @@ def cmd_tui(args: argparse.Namespace) -> int:
                 "routing_policies": {"cheap-review": {"model": None}}
             })
         return False
+
+    def _agent_type_from_entry(entry):
+        agent_type = entry.get("agent_type")
+        if agent_type:
+            return str(agent_type)
+        model = str(entry.get("requested_model") or entry.get("model") or "")
+        for candidate in ("explorer", "worker", "reviewer"):
+            if model in (f"subagent-router-{candidate}", f"deepseek-{candidate}"):
+                return candidate
+        return ""
+
+    def current_delegation_profile(remote_config=None):
+        installed = installed_delegation_profile(codex_home)
+        if installed != DEFAULT_PROFILE:
+            return installed
+        raw_profile = (remote_config or {}).get("delegation_profile")
+        if raw_profile:
+            try:
+                return normalize_profile(raw_profile)
+            except ValueError:
+                pass
+        return installed
+
+    def switch_delegation_profile(profile):
+        ok, normalized, detail = _switch_delegation_profile(
+            codex_home,
+            proxy_url,
+            profile,
+            force=False,
+        )
+        if not ok and detail:
+            return False, f"[red]Profile switch failed: {detail}[/red]"
+        if not ok:
+            return (
+                False,
+                (
+                    f"[yellow]Profile unchanged; custom instructions preserved. "
+                    f"Run init --profile {normalized} --force to overwrite.[/yellow]"
+                ),
+            )
+        return True, f"[green]Delegation profile → {normalized}; init completed.[/green]"
 
     def generate_dashboard(remote_config=None) -> Layout:
         layout = Layout()
@@ -551,9 +625,11 @@ def cmd_tui(args: argparse.Namespace) -> int:
         # Config Panel
         current_provider = remote_config.get("provider") if remote_config else settings.provider
         current_mode = remote_config.get("budget_mode") if remote_config else settings.budget_mode
+        delegation_profile = current_delegation_profile(remote_config)
         config_info = Table(show_header=False, box=None)
         config_info.add_row("[bold]Status:[/bold]", "[green]UP[/green]" if remote_config else "[red]DOWN[/red]")
         config_info.add_row("[bold]Provider:[/bold]", f"[magenta]{current_provider}[/magenta]")
+        config_info.add_row("[bold]Delegation Profile:[/bold]", f"[cyan]{delegation_profile}[/cyan]")
         config_info.add_row("[bold]Budget Mode:[/bold]", f"[yellow]{current_mode}[/yellow]")
         config_info.add_row("[bold]Fallbacks:[/bold]", ", ".join(settings.fallback_providers) or "none")
 
@@ -592,6 +668,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
         activity_table.add_column("Time", style="dim")
         activity_table.add_column("Status")
         activity_table.add_column("Provider")
+        activity_table.add_column("Agent")
         activity_table.add_column("Toks (in/cache/out)", justify="right")
         activity_table.add_column("Cost", justify="right")
 
@@ -619,11 +696,11 @@ def cmd_tui(args: argparse.Namespace) -> int:
                     else:
                         t_str = ""
 
-                    activity_table.add_row(ts, status, entry.get("provider", "???"), t_str, f"${entry.get('estimated_cost_usd', 0.0):.4f}")
+                    activity_table.add_row(ts, status, entry.get("provider", "???"), _agent_type_from_entry(entry), t_str, f"${entry.get('estimated_cost_usd', 0.0):.4f}")
             except Exception:
-                activity_table.add_row("", "[yellow]Audit log error[/yellow]", "", "", "")
+                activity_table.add_row("", "[yellow]Audit log error[/yellow]", "", "", "", "")
         else:
-            activity_table.add_row("", "[dim]No activity yet[/dim]", "", "", "")
+            activity_table.add_row("", "[dim]No activity yet[/dim]", "", "", "", "")
 
         main_layout["activity"].update(Panel(activity_table, title="Recent Requests", border_style="magenta"))
         layout["main"].update(main_layout)
@@ -755,6 +832,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
         remote = state.last_config
         current_provider = remote.get("provider") if remote else settings.provider
         current_mode = remote.get("budget_mode") if remote else settings.budget_mode
+        delegation_profile = current_delegation_profile(remote)
 
         cfg = remote or {}
 
@@ -768,6 +846,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
             config_info.add_row("[bold]Health:[/bold]", avail)
 
         config_info.add_row("[bold]Provider:[/bold]", f"[magenta]{current_provider}[/magenta]")
+        config_info.add_row("[bold]Delegation Profile:[/bold]", f"[cyan]{delegation_profile}[/cyan]")
         model_name = "unknown"
         if remote:
             model_name = remote.get('providers', {}).get(current_provider, {}).get('model')
@@ -777,29 +856,30 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
         config_info.add_row("[bold]Model:[/bold]", f"[cyan]{model_name}[/cyan]")
         
-        # Routing policies (Worker/Reviewer)
+        # Routing policies and role assignments.
         policies = cfg.get("routing_policies", {})
-        
-        # Role Assignments (Worker/Reviewer)
         pricing = remote.get("provider_pricing", {}) if remote else {}
         cur_pricing = pricing.get(current_provider, {})
 
-        for role_name, policy_key in [("Worker", "safe-default"), ("Reviewer", "cheap-review")]:
-            policy = policies.get(policy_key, {})
+        for role_name, policy_key, model_key, default_alias in [
+            ("Explorer", None, "explorer_model", "deepseek-v4-flash"),
+            ("Worker", "safe-default", "worker_model", "deepseek-v4-flash"),
+            ("Reviewer", "cheap-review", "reviewer_model", "deepseek-v4-pro"),
+        ]:
+            policy = policies.get(policy_key, {}) if policy_key else {}
             p_provider = policy.get("provider")
             p_model = policy.get("model")
             
             # If no global policy, check current provider's specific role assignment
             if not p_provider and not p_model:
-                p_model = cur_pricing.get("worker_model" if role_name == "Worker" else "reviewer_model")
+                p_model = cur_pricing.get(model_key)
                 if p_model:
                     p_provider = current_provider
 
-            if p_provider or p_model:
-                p_val = f"[cyan]{p_model or model_name}[/cyan]"
-                if p_provider:
-                    p_val += f" [dim]on {p_provider}[/dim]"
-                config_info.add_row(f"[bold]{role_name}:[/bold]", p_val)
+            p_val = f"[cyan]{p_model or default_alias}[/cyan]"
+            if p_provider:
+                p_val += f" [dim]on {p_provider}[/dim]"
+            config_info.add_row(f"[bold]{role_name}:[/bold]", p_val)
 
         config_info.add_row("[bold]Budget Mode:[/bold]", f"[yellow]{current_mode}[/yellow]")
         config_info.add_row("[bold]Fallbacks:[/bold]", f"[dim]{', '.join(settings.fallback_providers) or 'none'}[/dim]")
@@ -892,15 +972,41 @@ def cmd_tui(args: argparse.Namespace) -> int:
                 counts["output"] += rc["output"]
                 counts["total"] += rc["total"]
             return counts
+        def _provider_message_from_value(value):
+            if isinstance(value, dict):
+                error = value.get("error")
+                if isinstance(error, dict) and error.get("message"):
+                    return str(error["message"])
+                if value.get("message"):
+                    return str(value["message"])
+                return ""
+            if not isinstance(value, str):
+                return ""
+            text = value.strip()
+            prefix = "provider rejected request:"
+            payload = text[len(prefix):].strip() if text.startswith(prefix) else text
+            if not payload.startswith(("{", "[")):
+                return ""
+            for parser in (json.loads, ast.literal_eval):
+                try:
+                    parsed = parser(payload)
+                except (ValueError, SyntaxError, TypeError):
+                    continue
+                return _provider_message_from_value(parsed)
+            return ""
         def _error_detail(entry):
             for key in ("message", "error", "reason"):
                 value = entry.get(key)
                 if value:
-                    return str(value)
+                    nested = _provider_message_from_value(value)
+                    return nested or str(value)
             chain = entry.get("fallback_chain") or []
             for attempt in reversed(chain):
                 if not isinstance(attempt, dict):
                     continue
+                nested = _provider_message_from_value(attempt.get("error"))
+                if nested:
+                    return nested
                 parts = [
                     str(attempt.get("status_code") or "").strip(),
                     str(attempt.get("error_category") or "").strip(),
@@ -968,6 +1074,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
         activity_table.add_column("Time", style="dim", width=10)
         activity_table.add_column("Status", width=28)
         activity_table.add_column("Provider", width=15)
+        activity_table.add_column("Agent", width=10)
         activity_table.add_column("Model", width=25)
         activity_table.add_column("Toks (in/cache/out)", justify="right")
         activity_table.add_column("Req Cost", justify="right")
@@ -1007,14 +1114,15 @@ def cmd_tui(args: argparse.Namespace) -> int:
                         ts,
                         st,
                         entry.get("provider", "???"),
+                        _agent_type_from_entry(entry),
                         str(entry.get("model", "???")),
                         t_str,
                         f"${entry.get('estimated_cost_usd', 0.0):.4f}",
                     )
             except Exception:
-                activity_table.add_row("", "[yellow]Audit log error[/yellow]", "", "", "", "")
+                activity_table.add_row("", "[yellow]Audit log error[/yellow]", "", "", "", "", "")
         else:
-            activity_table.add_row("", "[dim]No activity yet[/dim]", "", "", "", "")
+            activity_table.add_row("", "[dim]No activity yet[/dim]", "", "", "", "", "")
 
         # Footer text — context-sensitive
         if state.menu == "provider":
@@ -1023,8 +1131,15 @@ def cmd_tui(args: argparse.Namespace) -> int:
             for i, p in enumerate(providers[:9]):
                 opts.append(f"[{i+1}] {p.capitalize()}")
             footer_text = "[bold yellow]Switch Provider:[/bold yellow] " + "  ".join(opts) + "  [Any] Back"
+        elif state.menu == "profile":
+            current = current_delegation_profile(remote)
+            opts = []
+            for i, profile in enumerate(CANONICAL_PROFILES[:9]):
+                marker = " *" if profile == current else ""
+                opts.append(f"[{i+1}] {profile}{marker}")
+            footer_text = "[bold yellow]Switch Delegation Profile:[/bold yellow] " + "  ".join(opts) + "  [0] Back"
         elif state.menu == "model_role":
-            footer_text = "[bold yellow]Assign Model to Role:[/bold yellow] [1] Global Default  [2] Worker  [3] Reviewer  [Any] Back"
+            footer_text = "[bold yellow]Assign Model to Role:[/bold yellow] [1] Global Default  [2] Explorer  [3] Worker  [4] Reviewer  [Any] Back"
         elif state.menu == "model":
             footer_text = f"[bold yellow]{state.model_menu_role.upper()} model for {state.model_menu_provider}:[/bold yellow] "
             opts = []
@@ -1062,7 +1177,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
         elif state.message:
             footer_text = state.message
         else:
-            footer_text = r"[bold]Actions:[/bold]  ↑ older  ↓ newer  PgUp/PgDn page  \[P] Provider  \[L] Model  \[C] Cost  \[B] Budget  \[M] Mode  \[R] Reset Usage  \[X] Clear Config  \[Q] Quit"
+            footer_text = r"[bold]Actions:[/bold]  ↑ older  ↓ newer  PgUp/PgDn page  \[P] Provider  \[D] Profile  \[L] Model  \[C] Cost  \[B] Budget  \[M] Mode  \[R] Reset Usage  \[X] Clear Config  \[Q] Quit"
 
         return config_info, budget_info, activity_table, footer_text
 
@@ -1153,6 +1268,8 @@ def cmd_tui(args: argparse.Namespace) -> int:
                             state.activity_offset = max(0, state.activity_offset - step)
                         elif ch == 'p':
                             state.menu = "provider"
+                        elif ch == 'd':
+                            state.menu = "profile"
                         elif ch == 'b':
                             state.menu = "budget"
                         elif ch == 'c':
@@ -1190,7 +1307,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
                                 state.message_expiry = now + 3
 
                     elif state.menu == "model_role":
-                        role_map = {"1": "default", "2": "worker", "3": "reviewer"}
+                        role_map = {"1": "default", "2": "explorer", "3": "worker", "4": "reviewer"}
                         if ch in role_map:
                             state.model_menu_role = role_map[ch]
                             # Start fetching
@@ -1236,6 +1353,20 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
                                 Thread(target=check_new_p, args=(new_p,), daemon=True).start()
                         state.menu = "main"
+
+                    elif state.menu == "profile":
+                        if ch == '0' or ch == '\x1b':
+                            state.menu = "main"
+                        elif ch.isdigit() and 1 <= int(ch) <= len(CANONICAL_PROFILES):
+                            new_profile = CANONICAL_PROFILES[int(ch) - 1]
+                            ok, message = switch_delegation_profile(new_profile)
+                            if ok:
+                                state.last_config = get_remote_config()
+                            state.message = message
+                            state.message_expiry = now + 5
+                            state.menu = "main"
+                        else:
+                            state.menu = "main"
 
                     elif state.menu == "model":
                         if ch.isdigit() and 1 <= int(ch) <= len(state.model_menu_options):
@@ -1552,11 +1683,13 @@ def stop_background(settings: Settings, *, timeout: float, force: bool, quiet: b
 
 def cmd_paths(args: argparse.Namespace) -> int:
     settings = settings_from_args(args)
+    delegation_profile = installed_delegation_profile()
     if args.json:
         print(json.dumps({
             **settings.sanitized_paths(),
             "provider_id": PROVIDER_ID,
             "provider_name": PROVIDER_NAME,
+            "delegation_profile": delegation_profile,
             "deepseek_base_url": settings.deepseek_base_url,
             "deepseek_model": settings.deepseek_model or "default",
             "mock_deepseek": settings.mock_deepseek,
@@ -1574,6 +1707,7 @@ def cmd_paths(args: argparse.Namespace) -> int:
             print(f"{name}: {path}")
         print(f"provider_id: {PROVIDER_ID}")
         print(f"provider_name: {PROVIDER_NAME}")
+        print(f"delegation_profile: {delegation_profile}")
         print(f"host: {settings.host}")
         print(f"port: {settings.port}")
         print(f"deepseek_base_url: {settings.deepseek_base_url}")
@@ -1634,26 +1768,65 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return 1
     print("Configuration looks good.")
     if args.json:
-        print(json.dumps({"healthy": True, "issues": issues, "provider": settings.provider}))
+        print(json.dumps({
+            "healthy": True,
+            "issues": issues,
+            "provider": settings.provider,
+            "delegation_profile": installed_delegation_profile(),
+        }))
     return 0
 
 
 def cmd_init(args: argparse.Namespace) -> int:
     codex_home = Path(args.codex_home).expanduser().resolve()
     proxy_url = args.proxy_url.rstrip("/")
+    try:
+        profile = normalize_profile(args.profile)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     codex_home.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest(codex_home)
 
     if args.mode == "default":
-        _init_default(codex_home, proxy_url, manifest, force=args.force)
+        _init_default(codex_home, proxy_url, manifest, profile=profile, force=args.force)
     elif args.mode == "opt-in":
+        if args.profile is not None:
+            print("warning: --profile is ignored with --mode opt-in; profile only affects --mode default", file=sys.stderr)
         _init_opt_in(codex_home, proxy_url, manifest, force=args.force)
     elif args.mode == "provider-only":
+        if args.profile is not None:
+            print("warning: --profile is ignored with --mode provider-only; profile only affects --mode default", file=sys.stderr)
         _init_provider_only(codex_home, proxy_url, manifest, force=args.force)
 
     _save_manifest(codex_home, manifest)
     return 0
+
+
+def _switch_delegation_profile(
+    codex_home: Path,
+    proxy_url: str,
+    profile: str,
+    *,
+    force: bool,
+) -> tuple[bool, str, str | None]:
+    """Run the default init flow for a profile switch.
+
+    Returns (switched, normalized_profile, error). switched is false with no
+    error when init preserved a user-customized instruction file.
+    """
+    try:
+        normalized = normalize_profile(profile)
+        codex_home.mkdir(parents=True, exist_ok=True)
+        manifest = _load_manifest(codex_home)
+        _init_default(codex_home, proxy_url.rstrip("/"), manifest, profile=normalized, force=force)
+        _save_manifest(codex_home, manifest)
+    except Exception as exc:
+        return False, str(profile), str(exc)
+
+    installed = installed_delegation_profile(codex_home)
+    return installed == normalized, normalized, None
 
 
 def _init_default(
@@ -1661,19 +1834,28 @@ def _init_default(
     proxy_url: str,
     manifest: dict,
     *,
+    profile: str,
     force: bool,
 ) -> None:
+    if profile == "manual":
+        _init_manual(codex_home, proxy_url, manifest, force=force)
+        return
+
+    instructions = subagent_router_instructions_for_profile(profile)
     # Write the delegation instructions file.
     system_file = codex_home / "SUBAGENT_ROUTER_INSTRUCTIONS.md"
     action = _managed_file_action(
         system_file,
-        SUBAGENT_ROUTER_SYSTEM_INSTRUCTIONS,
+        instructions,
         manifest.get("files", {}).get("SUBAGENT_ROUTER_INSTRUCTIONS.md"),
         force=force,
+        legacy_hashes=LEGACY_MANAGED_HASHES.get("SUBAGENT_ROUTER_INSTRUCTIONS.md", ()),
     )
-    if action == "write":
-        system_file.write_text(SUBAGENT_ROUTER_SYSTEM_INSTRUCTIONS, encoding="utf-8")
-    _update_manifest_file_entry(manifest, "SUBAGENT_ROUTER_INSTRUCTIONS.md", SUBAGENT_ROUTER_SYSTEM_INSTRUCTIONS)
+    if action in ("write", "adopt"):
+        if action == "write":
+            system_file.write_text(instructions, encoding="utf-8")
+        manifest["delegation_profile"] = profile
+        _update_manifest_file_entry(manifest, "SUBAGENT_ROUTER_INSTRUCTIONS.md", instructions)
 
     # Reference the instructions file from AGENTS.md.
     agents_path = codex_home / "AGENTS.md"
@@ -1697,10 +1879,45 @@ def _init_default(
         agents_path.write_text(f"{ref_line}\n", encoding="utf-8")
 
     # Write agent role files.
-    _write_agent_file(codex_home, manifest, "agents/subagent-router-worker.toml", WORKER_AGENT, force=force)
-    _write_agent_file(codex_home, manifest, "agents/subagent-router-reviewer.toml", REVIEWER_AGENT, force=force)
+    _write_router_agent_files(codex_home, manifest, force=force)
 
     # Write provider config block to config.toml.
+    _write_provider_config(codex_home, proxy_url, force=force)
+
+
+def _init_manual(
+    codex_home: Path,
+    proxy_url: str,
+    manifest: dict,
+    *,
+    force: bool,
+) -> None:
+    system_file = codex_home / "SUBAGENT_ROUTER_INSTRUCTIONS.md"
+    prev_entry = manifest.get("files", {}).get("SUBAGENT_ROUTER_INSTRUCTIONS.md")
+    action = _managed_file_action(
+        system_file,
+        "",
+        prev_entry,
+        force=force,
+        legacy_hashes=LEGACY_MANAGED_HASHES.get("SUBAGENT_ROUTER_INSTRUCTIONS.md", ()),
+    )
+    if system_file.exists() and action == "write":
+        system_file.unlink()
+        manifest.get("files", {}).pop("SUBAGENT_ROUTER_INSTRUCTIONS.md", None)
+
+    agents_path = codex_home / "AGENTS.md"
+    if agents_path.exists():
+        instruction_path = system_file.resolve()
+        ref_line = f"Follow instructions in {instruction_path}"
+        legacy_ref_line = f"{instruction_path}"
+        existing = agents_path.read_text(encoding="utf-8")
+        lines = existing.splitlines()
+        if lines and lines[0] in (ref_line, legacy_ref_line):
+            trailing_newline = "\n" if existing.endswith("\n") and len(lines) > 1 else ""
+            agents_path.write_text("\n".join(lines[1:]) + trailing_newline, encoding="utf-8")
+
+    manifest["delegation_profile"] = "manual"
+    _write_router_agent_files(codex_home, manifest, force=force)
     _write_provider_config(codex_home, proxy_url, force=force)
 
 
@@ -1737,8 +1954,7 @@ def _init_opt_in(
         sc_path.write_text(DEEPSEEK_SLASH_COMMAND, encoding="utf-8")
     _update_manifest_file_entry(manifest, "slash_commands/deepseek.md", DEEPSEEK_SLASH_COMMAND)
 
-    _write_agent_file(codex_home, manifest, "agents/subagent-router-worker.toml", WORKER_AGENT, force=force)
-    _write_agent_file(codex_home, manifest, "agents/subagent-router-reviewer.toml", REVIEWER_AGENT, force=force)
+    _write_router_agent_files(codex_home, manifest, force=force)
     _write_provider_config(codex_home, proxy_url, force=force)
 
 
@@ -1749,9 +1965,14 @@ def _init_provider_only(
     *,
     force: bool,
 ) -> None:
+    _write_router_agent_files(codex_home, manifest, force=force)
+    _write_provider_config(codex_home, proxy_url, force=force)
+
+
+def _write_router_agent_files(codex_home: Path, manifest: dict, *, force: bool) -> None:
+    _write_agent_file(codex_home, manifest, "agents/subagent-router-explorer.toml", EXPLORER_AGENT, force=force)
     _write_agent_file(codex_home, manifest, "agents/subagent-router-worker.toml", WORKER_AGENT, force=force)
     _write_agent_file(codex_home, manifest, "agents/subagent-router-reviewer.toml", REVIEWER_AGENT, force=force)
-    _write_provider_config(codex_home, proxy_url, force=force)
 
 
 def _write_agent_file(
@@ -1888,6 +2109,23 @@ def _save_manifest(codex_home: Path, manifest: dict) -> None:
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def installed_delegation_profile(codex_home: Path | None = None) -> str:
+    root = codex_home
+    if root is None:
+        root = Path(os.getenv("CODEX_HOME", "~/.codex")).expanduser()
+    manifest_path = root / MANIFEST_FILENAME
+    if not manifest_path.exists():
+        return DEFAULT_PROFILE
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        profile = manifest.get("delegation_profile")
+        if isinstance(profile, str):
+            return normalize_profile(profile)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return DEFAULT_PROFILE
+    return DEFAULT_PROFILE
 
 
 def _update_manifest_file_entry(manifest: dict, relative_path: str, content: str) -> None:

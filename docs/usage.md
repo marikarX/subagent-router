@@ -56,6 +56,7 @@ Default mode writes:
 
 - `~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md`
 - `Follow instructions in ...` at the top of `~/.codex/AGENTS.md`
+- `~/.codex/agents/subagent-router-explorer.toml`
 - `~/.codex/agents/subagent-router-worker.toml`
 - `~/.codex/agents/subagent-router-reviewer.toml`
 - a managed `subagent_router` provider block in `~/.codex/config.toml`
@@ -65,12 +66,49 @@ Optional modes:
 ```shell
 subagent-router init --mode opt-in
 subagent-router init --mode provider-only
+subagent-router init --profile cost-optimization     # default
+subagent-router init --profile deep-delegation
+subagent-router init --profile orchestrator
+subagent-router init --profile manual
 ```
 
-`--mode opt-in` writes the `$deepseek` skill and `/deepseek` slash command
-instead of `SUBAGENT_ROUTER_INSTRUCTIONS.md` or an `AGENTS.md` path reference.
+`--mode opt-in` writes the `$deepseek` skill, `/deepseek` slash command,
+router agent roles, and provider config, without global profile instructions
+or an `AGENTS.md` path reference.
 
 `--mode provider-only` writes only the provider config and agent role files.
+
+`--profile` selects a delegation profile that controls how the parent coding
+agent uses router subagents. It only affects `--mode default`.
+
+- `cost-optimization` (default) — minimize parent Codex/GPT-5.5 token usage
+  with compact subagent output, retry caps, and selective delegation.
+- `deep-delegation` — maximize offload to router agents. Useful for
+  experiments, external review, and quality-through-delegation, but not
+  guaranteed to minimize parent tokens.
+- `orchestrator` — the parent acts as the primary orchestrator, keeping
+  broader control over architecture decisions, risky changes, and final
+  acceptance while selectively offloading bounded work.
+- `manual` — install provider config and router agent roles without global
+  automatic delegation.
+
+Cost optimization is best-effort and measured through reduced parent Codex
+token usage, not wall-clock time.
+
+Manual and legacy opt-in workflows:
+
+```shell
+subagent-router init --mode opt-in
+subagent-router init --mode provider-only
+```
+
+`--mode opt-in` means no global automatic delegation. Use `$deepseek` or
+`/deepseek` explicitly. `--mode provider-only` installs provider config and
+role files only.
+
+Profile selection is persisted in `~/.codex/.subagent-router-manifest.json` under
+`delegation_profile`. The active profile is shown by `subagent-router paths`, `subagent-router tui`,
+and `subagent-router doctor --json`.
 
 The md/toml templates are bundled in the package under
 `src/subagent_router/templates/`.
@@ -298,6 +336,7 @@ Default mode writes:
 
 - `~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md`
 - `Follow instructions in ~/.codex/SUBAGENT_ROUTER_INSTRUCTIONS.md` at the top of `~/.codex/AGENTS.md`
+- `~/.codex/agents/subagent-router-explorer.toml`
 - `~/.codex/agents/subagent-router-worker.toml`
 - `~/.codex/agents/subagent-router-reviewer.toml`
 - a managed `subagent_router` provider block in `~/.codex/config.toml`
@@ -435,6 +474,102 @@ Config precedence:
 3. Per-project config (`.subagent-router.toml`)
 4. User-global config (`~/.config/subagent-router/config.toml`)
 5. Built-in defaults
+
+## Delegation Profiles
+
+Delegation profiles govern the instructions placed into the Codex environment
+by `subagent-router init --mode default`. Each profile defines a different
+parent-model role and delegation discipline.
+
+### `cost-optimization` (default)
+
+**Goal**: Minimize parent Codex/GPT-5.5 token usage through compact subagent
+output, strict local-work limits, retry caps, and selective delegation.
+
+**Parent model role**: Minimal coordinator.
+
+- Perform at most one cheap scope or marker scan before delegation.
+- Avoid broad local repo exploration and long local reasoning over delegated implementation.
+- Require compact structured subagent outputs.
+- Stop rather than silently taking over non-trivial work after delegation failure.
+- Treat the local-work limits as model-agnostic; a cheaper parent model is not permission for local coding or fixing.
+- Hard-stop instead of patching locally when tests fail or hang, worker output is incomplete, or the issue involves protocol, socket, concurrency, lifecycle, security, performance, or API behavior.
+
+**Delegation discipline**:
+
+1. Use explorer only when it saves parent exploration tokens.
+2. Use worker when implementation can be bounded and tests can be run by the worker.
+3. Use reviewer only for explicit review/audit requests or risk areas such as concurrency, auth, persistence, migrations, data loss, security, benchmark, or performance work.
+4. Keep parent edits to trivial integration edits.
+5. Cap continuations, replacements, reviewers, and remediation loops.
+6. Report roles used, attempt counts, incomplete subagent responses, and parent local edits when cost or benchmark evaluation matters.
+
+Cost optimization is best-effort and measured through reduced parent Codex
+token usage, not wall-clock time.
+
+### `deep-delegation`
+
+**Goal**: Maximize external delegation for exploration, implementation, review,
+and remediation. This can improve quality and reduce some parent work, but it
+is not guaranteed to minimize parent tokens.
+
+**Parent model role**: Delegation coordinator and final acceptor.
+
+**Delegation discipline**:
+
+1. Spawn router agents early once a bounded task and repository root are clear.
+2. Use explorer for unknown repos and scoped discovery.
+3. Use worker for first complete implementation drafts, tests, bounded fixes, refactors, and remediation.
+4. Use reviewer after a concrete diff, file set, or review scope exists.
+5. Send actionable reviewer findings back to worker instead of silently taking over non-trivial implementation locally.
+
+### `orchestrator`
+
+**Goal**: Preserve broader Codex/GPT-5.5 control while using lower-cost router
+subagents for bounded implementation, exploration, and review assistance.
+
+**Parent model role**: Primary orchestrator.
+
+- Own architecture decisions, task decomposition, and final acceptance review.
+- Handle risky migrations, security-sensitive changes, and ambiguous product decisions.
+- Make integration decisions after subagent output.
+
+**Delegation discipline**:
+
+1. Create a short plan.
+2. Delegate bounded first-pass work when practical.
+3. The parent may inspect source, diffs, and tests more deeply when needed for quality or risk control.
+4. The parent consolidates final results.
+5. If router delegation fails, continue locally only when necessary and clearly report that router offload failed.
+
+### Mode compatibility
+
+| Mode | Profile-aware | Installs |
+|---|---|---|
+| `default` | Yes (via `--profile`) | Instructions file, AGENTS.md reference, agent roles, provider config |
+| `opt-in` | No | DeepSeek skill, slash command, agent roles, provider config |
+| `provider-only` | No | Provider config and agent roles only |
+| `manual` profile | Yes | Provider config and agent roles only |
+
+### Installed agent roles
+
+Three agent roles are written to `~/.codex/agents/` during `init`:
+
+| Role file | Agent name | Sandbox | Purpose |
+|---|---|---|---|
+| `subagent-router-explorer.toml` | `subagent_router_explorer` | read-only | Fast read-only repo discovery, file mapping, call-path tracing, configuration discovery, and scoped technical questions |
+| `subagent-router-worker.toml` | `subagent_router_worker` | workspace-write | Delegated repo inspection, first-pass implementation, refactors, tests, documentation updates, and bounded bug fixes |
+| `subagent-router-reviewer.toml` | `subagent_router_reviewer` | read-only | First-pass code review, regression analysis, edge cases, benchmark audits, implementation critique, and maintainability review |
+
+Each role targets a provider-independent `subagent-router-*` model via the
+`subagent_router` provider. The proxy maps those role models to the configured
+backend model for the active provider. Instructions in the role files define
+safe boundaries (e.g., explorers and reviewers must not edit files; workers
+own bounded implementation but must not handle secrets or destructive
+operations).
+
+The role templates are bundled at
+`src/subagent_router/templates/agents/subagent-router-*.toml`.
 
 ## Routing Policies
 

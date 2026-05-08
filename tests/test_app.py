@@ -102,6 +102,14 @@ class AppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["output"][0]["type"], "message")
 
+    def test_config_endpoint_includes_delegation_profile(self):
+        from fastapi.testclient import TestClient
+
+        response = TestClient(proxy_app.app).get("/v1/config")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["delegation_profile"], "cost-optimization")
+
     def test_empty_chat_completion_output_is_rejected(self):
         payload = {"model": "deepseek-chat", "stream": False, "input": "hello", "tools": []}
         normalized = normalize_request(payload)
@@ -140,7 +148,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(proxy_app.ACTIVITY_STATE["error_count"], 1)
 
     def test_progress_only_final_text_for_subagent_is_rejected(self):
-        payload = {"model": "deepseek-worker", "stream": False, "input": "fix it", "tools": []}
+        payload = {"model": "subagent-router-worker", "stream": False, "input": "fix it", "tools": []}
         normalized = normalize_request(payload)
         chat_response = {"choices": [{"message": {"role": "assistant", "content": "Now I'll fix both call sites:"}}]}
 
@@ -148,7 +156,7 @@ class AppTests(unittest.TestCase):
             proxy_app.responses_object(payload, normalized, chat_response)
 
     def test_progress_only_final_text_variants_for_subagent_are_rejected(self):
-        payload = {"model": "deepseek-worker", "stream": False, "input": "fix it", "tools": []}
+        payload = {"model": "subagent-router-worker", "stream": False, "input": "fix it", "tools": []}
         normalized = normalize_request(payload)
         variants = [
             "Let me now apply the patch.",
@@ -167,7 +175,7 @@ class AppTests(unittest.TestCase):
                     proxy_app.responses_object(payload, normalized, chat_response)
 
     def test_progress_only_final_text_allows_real_completion_summary(self):
-        payload = {"model": "deepseek-worker", "stream": False, "input": "fix it", "tools": []}
+        payload = {"model": "subagent-router-worker", "stream": False, "input": "fix it", "tools": []}
         normalized = normalize_request(payload)
         chat_response = {
             "choices": [
@@ -187,7 +195,7 @@ class AppTests(unittest.TestCase):
 
     def test_write_worker_final_without_apply_patch_evidence_is_rejected(self):
         payload = {
-            "model": "deepseek-worker",
+            "model": "subagent-router-worker",
             "stream": False,
             "input": "Change docs/troubleshooting.md wording.",
             "tools": [
@@ -216,7 +224,7 @@ class AppTests(unittest.TestCase):
 
     def test_write_worker_final_allows_no_change_rationale_without_apply_patch(self):
         payload = {
-            "model": "deepseek-worker",
+            "model": "subagent-router-worker",
             "stream": False,
             "input": "Change docs/troubleshooting.md wording.",
             "tools": [
@@ -246,7 +254,7 @@ class AppTests(unittest.TestCase):
 
     def test_write_worker_final_allows_completion_after_apply_patch_tool_result(self):
         payload = {
-            "model": "deepseek-worker",
+            "model": "subagent-router-worker",
             "stream": False,
             "input": [
                 {
@@ -314,7 +322,7 @@ class AppTests(unittest.TestCase):
         try:
             response = TestClient(proxy_app.app).post(
                 "/v1/responses",
-                json={"model": "deepseek-worker", "stream": False, "input": "fix docs", "tools": []},
+                json={"model": "subagent-router-worker", "stream": False, "input": "fix docs", "tools": []},
             )
         finally:
             proxy_app.call_provider = original_call_provider
@@ -378,7 +386,7 @@ class AppTests(unittest.TestCase):
             response = TestClient(proxy_app.app).post(
                 "/v1/responses",
                 json={
-                    "model": "deepseek-worker",
+                    "model": "subagent-router-worker",
                     "stream": False,
                     "input": "fix docs",
                     "tools": [
@@ -435,7 +443,7 @@ class AppTests(unittest.TestCase):
             response = TestClient(proxy_app.app).post(
                 "/v1/responses",
                 json={
-                    "model": "deepseek-worker",
+                    "model": "subagent-router-worker",
                     "stream": False,
                     "input": "Change docs/troubleshooting.md wording.",
                     "tools": [
@@ -468,7 +476,7 @@ class AppTests(unittest.TestCase):
 
     def test_default_settings_preserve_apply_patch_for_worker_requests(self):
         payload = {
-            "model": "deepseek-worker",
+            "model": "subagent-router-worker",
             "tools": [
                 {
                     "type": "function",
@@ -489,7 +497,7 @@ class AppTests(unittest.TestCase):
 
     def test_default_settings_still_drop_apply_patch_for_reviewer_requests(self):
         payload = {
-            "model": "deepseek-reviewer",
+            "model": "subagent-router-reviewer",
             "tools": [
                 {
                     "type": "function",
@@ -509,7 +517,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(normalized.dropped_tools, ["apply_patch"])
 
     def test_valid_subagent_final_message_still_works(self):
-        payload = {"model": "deepseek-worker", "stream": False, "input": "fix it", "tools": []}
+        payload = {"model": "subagent-router-worker", "stream": False, "input": "fix it", "tools": []}
         normalized = normalize_request(payload)
         chat_response = {
             "choices": [
@@ -530,7 +538,7 @@ class AppTests(unittest.TestCase):
         self.assertIn("Changed", body["output"][0]["content"][0]["text"])
 
     def test_budget_helpers_accept_provider_and_model_limits(self):
-        normalized = normalize_request({"model": "deepseek-worker", "input": "x" * 200, "tools": []})
+        normalized = normalize_request({"model": "subagent-router-worker", "input": "x" * 200, "tools": []})
         config = proxy_app.ProviderConfig(
             name="deepseek",
             kind="cloud",
@@ -570,7 +578,7 @@ class AppTests(unittest.TestCase):
         )
 
     def test_predicted_request_budget_can_hard_stop_before_provider_call(self):
-        normalized = normalize_request({"model": "deepseek-worker", "input": "hello", "tools": []})
+        normalized = normalize_request({"model": "subagent-router-worker", "input": "hello", "tools": []})
         config = proxy_app.ProviderConfig(
             name="deepseek",
             kind="cloud",
@@ -667,7 +675,7 @@ class AppTests(unittest.TestCase):
 
         client = TestClient(proxy_app.app)
         payload = {
-            "model": "deepseek-reviewer",
+            "model": "subagent-router-reviewer",
             "stream": False,
             "input": [
                 {
@@ -689,10 +697,10 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(proxy_app.ACTIVITY_STATE["error_count"], 1)
-        self.assertEqual(proxy_app.ACTIVITY_STATE["last_model"], "deepseek-reviewer")
+        self.assertEqual(proxy_app.ACTIVITY_STATE["last_model"], "subagent-router-reviewer")
         audit = proxy_app.SETTINGS.audit_log_file.read_text(encoding="utf-8")
         self.assertIn('"status": "error"', audit)
-        self.assertIn('"model": "deepseek-reviewer"', audit)
+        self.assertIn('"model": "subagent-router-reviewer"', audit)
         self.assertIn('"provider": "deepseek"', audit)
 
     def test_create_response_records_provider_metadata_usage_and_audit(self):
@@ -721,7 +729,7 @@ class AppTests(unittest.TestCase):
 
         client = TestClient(proxy_app.app)
         payload = {
-            "model": "deepseek-reviewer",
+            "model": "subagent-router-reviewer",
             "stream": False,
             "input": "read-only smoke test",
             "tools": [],
@@ -781,6 +789,117 @@ class AppTests(unittest.TestCase):
         self.assertEqual(body["metadata"]["provider"], "ollama")
         self.assertEqual(body["metadata"]["provider_kind"], "local")
         self.assertEqual(body["metadata"]["provider_selection_reason"], "manual override")
+
+    def test_default_ollama_route_uses_configured_worker_model_for_subagent_alias(self):
+        from fastapi.testclient import TestClient
+        from subagent_router.providers import ProviderConfig
+
+        original_build_provider = proxy_app.build_provider
+
+        class FakeProvider:
+            def __init__(self, config):
+                self.config = config
+
+            async def chat(self, normalized, *, model=None):
+                return proxy_app.ProviderResponse(
+                    provider=self.config.name,
+                    model=model or self.config.model or normalized.model,
+                    provider_kind=self.config.kind,
+                    chat_response={
+                        "choices": [{"message": {"role": "assistant", "content": "local ok"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    },
+                    latency_ms=3,
+                    estimated_usage=False,
+                )
+
+        proxy_app.SETTINGS.provider = "ollama"
+        proxy_app.SETTINGS.fallback_providers = []
+        proxy_app.SETTINGS.providers["ollama"] = ProviderConfig(
+            name="ollama",
+            kind="local",
+            provider_type="ollama",
+            base_url="http://127.0.0.1:11434",
+            model="qwen3.5:latest",
+            enabled=True,
+            explorer_model="qwen3.5:latest",
+            worker_model="qwen3.5:latest",
+            reviewer_model="qwen3.5:latest",
+        )
+        proxy_app.build_provider = lambda config: FakeProvider(config)
+        try:
+            response = TestClient(proxy_app.app).post(
+                "/v1/responses",
+                json={"model": "subagent-router-worker", "stream": False, "input": "hello", "tools": []},
+            )
+        finally:
+            proxy_app.build_provider = original_build_provider
+
+        body = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["metadata"]["provider"], "ollama")
+        self.assertEqual(body["metadata"]["provider_model"], "qwen3.5:latest")
+        audit = proxy_app.SETTINGS.audit_log_file.read_text(encoding="utf-8")
+        self.assertIn('"model": "qwen3.5:latest"', audit)
+        self.assertNotIn('"model": "deepseek-v4-flash"', audit)
+
+    def test_default_route_uses_configured_explorer_model_for_subagent_alias(self):
+        from fastapi.testclient import TestClient
+        from subagent_router.providers import ProviderConfig
+
+        original_build_provider = proxy_app.build_provider
+
+        class FakeProvider:
+            def __init__(self, config):
+                self.config = config
+
+            async def chat(self, normalized, *, model=None):
+                return proxy_app.ProviderResponse(
+                    provider=self.config.name,
+                    model=model or self.config.model or normalized.model,
+                    provider_kind=self.config.kind,
+                    chat_response={
+                        "choices": [{"message": {"role": "assistant", "content": "local ok"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    },
+                    latency_ms=3,
+                    estimated_usage=False,
+                )
+
+        proxy_app.SETTINGS.provider = "ollama"
+        proxy_app.SETTINGS.fallback_providers = []
+        proxy_app.SETTINGS.providers["ollama"] = ProviderConfig(
+            name="ollama",
+            kind="local",
+            provider_type="ollama",
+            base_url="http://127.0.0.1:11434",
+            model="qwen3.5:latest",
+            enabled=True,
+            explorer_model="qwen-explorer:latest",
+        )
+        proxy_app.build_provider = lambda config: FakeProvider(config)
+        try:
+            response = TestClient(proxy_app.app).post(
+                "/v1/responses",
+                json={"model": "subagent-router-explorer", "stream": False, "input": "map files", "tools": []},
+            )
+        finally:
+            proxy_app.build_provider = original_build_provider
+
+        body = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["metadata"]["provider_model"], "qwen-explorer:latest")
+
+    def test_safe_provider_error_prefers_nested_message(self):
+        response = httpx.Response(
+            400,
+            json={"error": {"message": "insufficient balance", "type": "billing"}},
+        )
+
+        self.assertEqual(
+            proxy_app.safe_provider_error(response),
+            "provider rejected request: insufficient balance",
+        )
 
     def test_http_error_increments_errors_by_provider(self):
         from fastapi.testclient import TestClient
@@ -919,7 +1038,7 @@ class AppTests(unittest.TestCase):
 
     def test_tool_call_response_preserves_reasoning_content_for_next_request(self):
         payload = {
-            "model": "deepseek-reviewer",
+            "model": "subagent-router-reviewer",
             "stream": False,
             "input": [
                 {
@@ -968,7 +1087,7 @@ class AppTests(unittest.TestCase):
 
     def test_assistant_text_response_preserves_reasoning_content_for_replay(self):
         payload = {
-            "model": "deepseek-reviewer",
+            "model": "subagent-router-reviewer",
             "stream": False,
             "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
             "tools": [],
@@ -990,7 +1109,7 @@ class AppTests(unittest.TestCase):
         proxy_app.responses_object(payload, normalized, chat_response)
         replay = normalize_request(
             {
-                "model": "deepseek-reviewer",
+                "model": "subagent-router-reviewer",
                 "input": [
                     {
                         "type": "message",
@@ -1057,7 +1176,7 @@ class AppTests(unittest.TestCase):
     def test_trace_request_includes_recent_tool_output_preview(self):
         normalized = normalize_request(
             {
-                "model": "deepseek-reviewer",
+                "model": "subagent-router-reviewer",
                 "input": [
                     {
                         "type": "function_call",
@@ -1080,11 +1199,11 @@ class AppTests(unittest.TestCase):
         self.assertIn("M app.py", output)
 
     def test_debug_activity_reports_recent_activity(self):
-        proxy_app.record_activity("request", trace_id="trace1", model="deepseek-reviewer")
+        proxy_app.record_activity("request", trace_id="trace1", model="subagent-router-reviewer")
         proxy_app.record_activity(
             "response",
             trace_id="trace1",
-            model="deepseek-reviewer",
+            model="subagent-router-reviewer",
             output_kind="tool_call",
             end_turn=False,
         )
@@ -1094,7 +1213,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(activity["request_count"], 1)
         self.assertEqual(activity["response_count"], 1)
         self.assertEqual(activity["last_trace_id"], "trace1")
-        self.assertEqual(activity["last_model"], "deepseek-reviewer")
+        self.assertEqual(activity["last_model"], "subagent-router-reviewer")
         self.assertEqual(activity["last_output_kind"], "tool_call")
         self.assertEqual(activity["last_end_turn"], False)
         self.assertTrue(activity["active_within_120s"])
@@ -1133,11 +1252,11 @@ class AppTests(unittest.TestCase):
         self.assertEqual(day["output_tokens"], 25)
 
     def test_activity_file_reports_recent_activity(self):
-        proxy_app.record_activity("request", trace_id="trace1", model="deepseek-reviewer")
+        proxy_app.record_activity("request", trace_id="trace1", model="subagent-router-reviewer")
         proxy_app.record_activity(
             "response",
             trace_id="trace1",
-            model="deepseek-reviewer",
+            model="subagent-router-reviewer",
             output_kind="tool_call",
             end_turn=False,
         )
@@ -1147,7 +1266,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(activity["request_count"], 1)
         self.assertEqual(activity["response_count"], 1)
         self.assertEqual(activity["last_trace_id"], "trace1")
-        self.assertEqual(activity["last_model"], "deepseek-reviewer")
+        self.assertEqual(activity["last_model"], "subagent-router-reviewer")
         self.assertEqual(activity["last_output_kind"], "tool_call")
         self.assertEqual(activity["last_end_turn"], False)
         self.assertTrue(activity["active_within_120s"])
@@ -1165,7 +1284,7 @@ class AppTests(unittest.TestCase):
         final_message = "No findings. " + " ".join(["details"] * 700)
         normalized = normalize_request(
             {
-                "model": "deepseek-reviewer",
+                "model": "subagent-router-reviewer",
                 "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "review"}]}],
                 "tools": [],
             }
@@ -1194,7 +1313,7 @@ class AppTests(unittest.TestCase):
         final_message = "Detailed final result"
         normalized = normalize_request(
             {
-                "model": "deepseek-reviewer",
+                "model": "subagent-router-reviewer",
                 "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "review"}]}],
                 "tools": [],
             }
@@ -1249,7 +1368,7 @@ class AppTests(unittest.TestCase):
 
     def test_provider_error_log_contains_sanitized_diagnostics(self):
         payload = {
-            "model": "deepseek-reviewer",
+            "model": "subagent-router-reviewer",
             "stream": False,
             "input": "Say hello",
             "tools": [
@@ -1284,7 +1403,7 @@ class AppTests(unittest.TestCase):
         path = proxy_app.log_provider_error(normalized, response)
         diagnostic = json.loads(path.read_text())
 
-        self.assertEqual(diagnostic["requested_model"], "deepseek-reviewer")
+        self.assertEqual(diagnostic["requested_model"], "subagent-router-reviewer")
         self.assertEqual(diagnostic["upstream_model"], "deepseek-v4-pro")
         self.assertEqual(diagnostic["upstream_status_code"], 400)
         self.assertEqual(diagnostic["input_item_count"], 1)
@@ -1417,7 +1536,7 @@ class AppTests(unittest.TestCase):
     def test_response_model_uses_requested_model_not_upstream_alias(self):
         """Response model preserves requested_model (deepseek-worker), not alias (deepseek-v4-flash)."""
         payload = {
-            "model": "deepseek-worker",
+            "model": "subagent-router-worker",
             "stream": False,
             "input": "hello",
             "tools": [],
@@ -1426,7 +1545,7 @@ class AppTests(unittest.TestCase):
         chat_response = asyncio.run(proxy_app.call_deepseek(normalized))
         body = proxy_app.responses_object(payload, normalized, chat_response)
         # original_payload has "model" key, so that should be used directly
-        self.assertEqual(body["model"], "deepseek-worker")
+        self.assertEqual(body["model"], "subagent-router-worker")
 
     def test_response_model_fallback_no_payload_model(self):
         """When payload omits model, fallback uses normalized.requested_model (e.g. deepseek-chat)."""
@@ -1799,8 +1918,18 @@ class AppTests(unittest.TestCase):
         self.assertIn("provider_health", result)
         self.assertIn("providers", result)
         self.assertEqual(result["status"], "ok")
+    def test_is_subagent_model_detects_router_aliases_only(self):
+        self.assertTrue(proxy_app.is_subagent_model("subagent-router-explorer"))
+        self.assertTrue(proxy_app.is_subagent_model("subagent-router-worker"))
+        self.assertTrue(proxy_app.is_subagent_model("subagent-router-reviewer"))
+        self.assertTrue(proxy_app.is_subagent_model("deepseek-explorer"))
+        self.assertTrue(proxy_app.is_subagent_model("deepseek-worker"))
+        self.assertTrue(proxy_app.is_subagent_model("deepseek-reviewer"))
 
-
+        self.assertFalse(proxy_app.is_subagent_model("deepseek-v4-flash"))
+        self.assertFalse(proxy_app.is_subagent_model("deepseek-v4-pro"))
+        self.assertFalse(proxy_app.is_subagent_model("deepseek-chat"))
+        self.assertFalse(proxy_app.is_subagent_model("gpt-4o"))
 
 if __name__ == "__main__":
     unittest.main()

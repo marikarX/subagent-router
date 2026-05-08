@@ -18,8 +18,9 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(normalized.input_item_count, 1)
 
     def test_model_aliases_map_to_upstream_model_names(self):
-        self.assertEqual(normalize_request({"model": "deepseek-worker"}).model, "deepseek-v4-flash")
-        self.assertEqual(normalize_request({"model": "deepseek-reviewer"}).model, "deepseek-v4-pro")
+        self.assertEqual(normalize_request({"model": "subagent-router-explorer"}).model, "deepseek-v4-flash")
+        self.assertEqual(normalize_request({"model": "subagent-router-worker"}).model, "deepseek-v4-flash")
+        self.assertEqual(normalize_request({"model": "subagent-router-reviewer"}).model, "deepseek-v4-pro")
         self.assertEqual(normalize_request({"model": "deepseek-chat"}).model, "deepseek-chat")
         self.assertEqual(normalize_request({"model": "deepseek-v4-flash"}).model, "deepseek-v4-flash")
         self.assertEqual(normalize_request({"model": "deepseek-v4-pro"}).model, "deepseek-v4-pro")
@@ -75,7 +76,7 @@ class NormalizationTests(unittest.TestCase):
     def test_browser_tool_is_dropped_and_exec_command_is_preserved(self):
         normalized = normalize_request(
             {
-                "model": "deepseek-reviewer",
+                "model": "subagent-router-reviewer",
                 "input": "review",
                 "tools": [
                     {
@@ -100,7 +101,7 @@ class NormalizationTests(unittest.TestCase):
     def test_apply_patch_is_dropped_for_read_only_requests_by_default(self):
         normalized = normalize_request(
             {
-                "model": "deepseek-reviewer",
+                "model": "subagent-router-reviewer",
                 "tools": [
                     {
                         "type": "function",
@@ -147,7 +148,7 @@ class NormalizationTests(unittest.TestCase):
     def test_apply_patch_is_preserved_for_worker_alias(self):
         normalized = normalize_request(
             {
-                "model": "deepseek-worker",
+                "model": "subagent-router-worker",
                 "tools": [
                     {
                         "type": "function",
@@ -166,7 +167,7 @@ class NormalizationTests(unittest.TestCase):
         """allow_apply_patch_enabled=False must drop apply_patch even for deepseek-worker."""
         normalized = normalize_request(
             {
-                "model": "deepseek-worker",
+                "model": "subagent-router-worker",
                 "tools": [
                     {
                         "type": "function",
@@ -186,7 +187,7 @@ class NormalizationTests(unittest.TestCase):
         with patch.dict("os.environ", {"DEEPSEEK_ALLOW_APPLY_PATCH": "1"}):
             normalized = normalize_request(
                 {
-                    "model": "deepseek-reviewer",
+                    "model": "subagent-router-reviewer",
                     "tools": [
                         {
                             "type": "function",
@@ -204,7 +205,7 @@ class NormalizationTests(unittest.TestCase):
         with patch.dict("os.environ", {"DEEPSEEK_ALLOW_APPLY_PATCH": "1"}):
             normalized = normalize_request(
                 {
-                    "model": "deepseek-reviewer",
+                    "model": "subagent-router-reviewer",
                     "tools": [
                         {
                             "type": "function",
@@ -223,7 +224,7 @@ class NormalizationTests(unittest.TestCase):
     def test_namespace_tools_are_dropped_by_default(self):
         normalized = normalize_request(
             {
-                "model": "deepseek-reviewer",
+                "model": "subagent-router-reviewer",
                 "tools": [
                     {
                         "type": "namespace",
@@ -348,7 +349,7 @@ class NormalizationTests(unittest.TestCase):
     def test_replayed_function_call_reattaches_reasoning_content(self):
         normalized = normalize_request(
             {
-                "model": "deepseek-reviewer",
+                "model": "subagent-router-reviewer",
                 "input": [
                     {
                         "type": "function_call",
@@ -372,7 +373,7 @@ class NormalizationTests(unittest.TestCase):
     def test_deepseek_v4_replay_adds_fallback_reasoning_content_when_cache_is_missing(self):
         normalized = normalize_request(
             {
-                "model": "deepseek-reviewer",
+                "model": "subagent-router-reviewer",
                 "input": [
                     {
                         "type": "message",

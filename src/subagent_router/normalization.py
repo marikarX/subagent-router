@@ -14,6 +14,10 @@ SECRET_KEY_RE = re.compile(
 )
 BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
 MODEL_ALIASES = {
+    "subagent-router-explorer": "deepseek-v4-flash",
+    "subagent-router-worker": "deepseek-v4-flash",
+    "subagent-router-reviewer": "deepseek-v4-pro",
+    "deepseek-explorer": "deepseek-v4-flash",
     "deepseek-worker": "deepseek-v4-flash",
     "deepseek-reviewer": "deepseek-v4-pro",
     "deepseek-chat": "deepseek-chat",
@@ -166,7 +170,7 @@ def allow_apply_patch(request: dict[str, Any], *, explicit_enabled: bool | None 
     env_value = os.environ.get(ALLOW_APPLY_PATCH_ENV)
     if env_value == "1":
         return True
-    if request.get("model") in ("deepseek-worker",):
+    if request.get("model") in ("deepseek-worker", "subagent-router-worker"):
         return True
     if isinstance(request.get("metadata"), dict):
         if request["metadata"].get("allow_apply_patch") is True:

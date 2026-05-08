@@ -38,6 +38,7 @@ class ProviderConfig:
     timeout_seconds: float | None = None
     send_parallel_tool_calls: bool = False
     model_pricing: dict[str, dict[str, float | None]] = field(default_factory=dict)
+    explorer_model: str | None = None
     worker_model: str | None = None
     reviewer_model: str | None = None
 

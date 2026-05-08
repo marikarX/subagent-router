@@ -6,6 +6,8 @@ Subagent Router lets primary coding agents delegate subagent tasks to alternate 
 
 The current Codex integration talks to this proxy through a local `/v1/responses` HTTP endpoint. The proxy normalizes requests to various backend formats, manages streaming SSE, and tracks usage across tasks, sessions, and days.
 
+![TUI](docs/img/TUI.webp)
+
 ## Install
 
 From npm:
@@ -35,7 +37,7 @@ subagent-router paths
 Install Codex integration files:
 
 ```shell
-subagent-router init
+subagent-router init                    # same as --profile cost-optimization
 ```
 
 Start the proxy:
@@ -62,6 +64,40 @@ DEEPSEEK_API_KEY=... subagent-router run -- codex
 - **Budget Controls**: Hard-stop or warn based on token usage or dollar cost per-task, per-session, or per-day.
 - **Observability**: Structured audit logs with deep token tracking (in/cache/out), real-time usage tracking, and a lightweight interactive Terminal UI (`tui`).
 - **Protocol Flexibility**: First-class support for the Codex internal Responses protocol, while also transparently accepting standard OpenAI `/v1/chat/completions` `messages` payloads for drop-in compatibility with curl and standard libraries.
+
+## Delegation Profiles
+
+Installation profiles control how router subagents are used by the parent coding agent.
+Pass `--profile` to `subagent-router init` to select one:
+
+| Profile | Default | Parent model role | Delegation style |
+|---|---|---|---|
+| `cost-optimization` | yes | Minimal coordinator | Best-effort parent token minimization with compact output, retry caps, and selective delegation |
+| `deep-delegation` | | Delegation coordinator and final acceptor | Maximizes router offload for exploration, implementation, review, and remediation |
+| `orchestrator` | | Primary orchestrator | Keeps broader Codex/GPT-5.5 control while using router agents as bounded helpers |
+| `manual` | | Explicit invocation only | Installs provider and role files without global automatic delegation |
+
+`subagent-router init` defaults to `subagent-router init --profile cost-optimization`.
+Cost optimization is best-effort and measured through reduced parent Codex token
+usage, not wall-clock time. It does not guarantee savings.
+
+Use `subagent-router init --profile deep-delegation` to maximize offload to
+router agents for experiments, external review, and quality-through-delegation.
+Use `subagent-router init --profile orchestrator` to keep Codex/GPT-5.5 in
+broader control. Use `subagent-router init --profile manual`, `--mode opt-in`,
+or `--mode provider-only` when you do not want global automatic delegation.
+
+`--profile` only affects `--mode default`. The `opt-in` and `provider-only`
+modes install no global profile instructions and print a warning if `--profile`
+is also supplied.
+
+Installed agent roles (written to `~/.codex/agents/subagent-router-*.toml` during `init`):
+
+- `subagent_router_explorer` — read-only repo discovery, file mapping, call-path tracing, and scoped technical questions
+- `subagent_router_worker` — delegated implementation, refactors, tests, and bounded bug fixes
+- `subagent_router_reviewer` — first-pass code review, regression analysis, and implementation critique
+
+See [docs/usage.md](docs/usage.md) for details on each profile and role.
 
 ## Configuration
 

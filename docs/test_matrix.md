@@ -32,11 +32,36 @@
   writes agent role files and provider config.
 - CLI `init`: preserves existing `AGENTS.md` content below the router path.
 - CLI `init`: replaces legacy bare router path in `AGENTS.md`.
-- CLI `init --mode opt-in`: installs skill and slash command, no global instructions.
+- CLI `init --mode opt-in`: installs skill, slash command, agent roles, and provider config;
+  no global instructions or AGENTS.md reference.
 - CLI `init --mode provider-only`: installs only provider config and agent roles.
 - CLI `init`: idempotent on same version.
 - CLI `init --force`: overwrites user modifications.
 - CLI `init`: marked config block is replaced, outer content preserved.
+- CLI `init --profile cost-optimization`: selects the default profile, writes matching
+  `SUBAGENT_ROUTER_INSTRUCTIONS.md`, and persists `delegation_profile` in manifest.
+- CLI `init --profile deep-delegation`: selects the deep-delegation profile with
+  corresponding instructions and manifest entry.
+- CLI `init --profile orchestrator`: selects the orchestrator profile with
+  corresponding instructions and manifest entry.
+- CLI `init --profile manual`: records the manual profile, installs provider config
+  and role files, and does not install global automatic delegation instructions.
+- CLI `init --profile` with an invalid value exits with code 2 and prints the
+  accepted profiles and aliases.
+- CLI `init --profile` aliases (`cost`, `budget`, `token-optimized`, `deep`,
+  `aggressive`, `quality`, `conservative`, `opt-in`, `provider-only`) resolve
+  to their canonical profile.
+- CLI `init --profile` only affects `--mode default`; `opt-in` and `provider-only` modes
+  ignore the profile argument.
+- CLI `init`: agent role files (`subagent-router-{explorer,worker,reviewer}.toml`) are
+  written to `~/.codex/agents/` with correct agent names and sandbox modes.
+- CLI `init`: agent role files contain expected agent names
+  (`subagent_router_explorer`, `subagent_router_worker`, `subagent_router_reviewer`).
+- CLI `init`: explorer, worker, and reviewer role files include compact output
+  contracts and DeepSeek role model aliases.
+- CLI `paths` displays the active delegation profile; `doctor --json` includes it.
+- API `/v1/config` includes the active delegation profile when available.
+- CLI `tui`: show delegation profile in config info panel.
 - CLI `run`: strips `DEEPSEEK_API_KEY` from child process env.
 - CLI `run`: strips configured secret keys from child process env.
 

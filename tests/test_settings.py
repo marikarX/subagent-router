@@ -319,6 +319,7 @@ max_tokens_per_session = 200000
                                 "cached_input_cost_per_million": 0.01,
                             }
                         },
+                        explorer_model="deepseek-v4-flash",
                         worker_model=None,
                         reviewer_model="deepseek-v4-pro",
                     ),
@@ -329,6 +330,7 @@ max_tokens_per_session = 200000
 
             data = json.loads((Path(state_dir) / "runtime_config.json").read_text(encoding="utf-8"))
             deepseek = data["providers"]["deepseek"]
+            self.assertEqual(deepseek["explorer_model"], "deepseek-v4-flash")
             self.assertNotIn("worker_model", deepseek)
             self.assertEqual(deepseek["reviewer_model"], "deepseek-v4-pro")
             self.assertNotIn("out", deepseek["model_pricing"]["custom-model"])
