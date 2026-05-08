@@ -623,6 +623,58 @@ class AppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["metadata"]["provider_model"], "cheap-explorer")
 
+    def test_manual_model_override_wins_over_role_model(self):
+        """Manual provider/model override should win over role-specific model selection."""
+        import asyncio
+        from fastapi import Request
+        from subagent_router.normalization import normalize_request
+
+        proxy_app.SETTINGS.providers["deepseek"] = replace(
+            proxy_app.SETTINGS.providers["deepseek"],
+            model="default-model",
+            explorer_model="cheap-explorer",
+            worker_model="worker-model",
+        )
+        proxy_app.SETTINGS.provider = "deepseek"
+        proxy_app.SETTINGS.fallback_providers = []
+
+        class CaptureProvider:
+            async def chat(self, normalized, model):
+                return proxy_app.ProviderResponse(
+                    provider="deepseek",
+                    model=model,
+                    provider_kind="cloud",
+                    chat_response={
+                        "choices": [{"message": {"role": "assistant", "content": "manual wins"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    },
+                    latency_ms=1,
+                    estimated_usage=False,
+                )
+
+        original_build_provider = proxy_app.build_provider
+        proxy_app.build_provider = lambda config: CaptureProvider()
+        try:
+            scope = {
+                "type": "http", "method": "POST", "path": "/v1/responses",
+                "query_string": b"provider=deepseek&model=manual-special-model",
+                "headers": [], "scheme": "http", "server": ("test", 80),
+            }
+            req = Request(scope)
+            payload = {"model": "subagent-router-explorer", "stream": False, "input": "map this repo", "tools": []}
+
+            route = proxy_app.select_route(req, payload)
+            self.assertEqual(route.provider, "deepseek")
+            self.assertEqual(route.model, "manual-special-model")
+            self.assertEqual(route.model_source, "manual")
+            self.assertEqual(route.reason, "manual override")
+
+            normalized = normalize_request(payload)
+            result = asyncio.run(proxy_app.call_provider(normalized, route))
+            self.assertEqual(result.model, "manual-special-model")
+        finally:
+            proxy_app.build_provider = original_build_provider
+
     def test_max_spend_aliases_are_enforced(self):
         proxy_app.SETTINGS.budget_mode = "hard-stop"
         proxy_app.SETTINGS.max_spend_per_task = 0.01
@@ -1940,7 +1992,6 @@ class AppTests(unittest.TestCase):
                 self.assertIn("provider_health_snapshot", record)
                 self.assertIn("audit-test-provider", str(record.get("provider_health_snapshot", {})))
         proxy_app.SETTINGS.provider_health.pop("audit-test-provider", None)
-
 
 
     # ---------- /health endpoint config_warnings and provider_health tests ----------

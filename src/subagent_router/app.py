@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 try:
     import httpx
@@ -515,9 +515,18 @@ class ProviderIncompleteOutputError(ValueError):
 
 
 class RouteSelection:
-    def __init__(self, provider: str, model: str | None, fallback_providers: list[str], policy: str, reason: str) -> None:
+    def __init__(
+        self,
+        provider: str,
+        model: str | None,
+        fallback_providers: list[str],
+        policy: str,
+        reason: str,
+        model_source: Literal["manual", "policy", "none"] = "none",
+    ) -> None:
         self.provider = provider
         self.model = model
+        self.model_source = model_source
         self.fallback_providers = fallback_providers
         self.policy = policy
         self.reason = reason
@@ -540,7 +549,14 @@ def select_route(request: Request, payload: dict[str, Any]) -> RouteSelection:
         or ""
     )
     if manual_provider:
-        return RouteSelection(str(manual_provider), str(manual_model) if manual_model else None, SETTINGS.fallback_providers, policy_name or "manual", "manual override")
+        return RouteSelection(
+            str(manual_provider),
+            str(manual_model) if manual_model else None,
+            SETTINGS.fallback_providers,
+            policy_name or "manual",
+            "manual override",
+            model_source="manual" if manual_model else "none",
+        )
     if policy_name:
         policy = built_in_policy(policy_name) | SETTINGS.routing_policies.get(policy_name, {})
         provider = str(policy.get("provider") or SETTINGS.provider)
@@ -563,7 +579,7 @@ def select_route(request: Request, payload: dict[str, Any]) -> RouteSelection:
             policy,
             base_reason=f"routing policy {policy_name}",
         )
-        return RouteSelection(provider, model, fallback_providers, policy_name, reason)
+        return RouteSelection(provider, model, fallback_providers, policy_name, reason, model_source="policy" if model else "none")
     provider, fallback_providers, reason = optimize_provider_order(
         SETTINGS.provider,
         SETTINGS.fallback_providers,
@@ -708,7 +724,10 @@ async def call_provider(normalized: NormalizedRequest, route: RouteSelection) ->
         if provider_name in SETTINGS.denied_providers:
             route.attempts.append({"provider": provider_name, "status": "blocked", "error": "denylisted"})
             raise ProviderConfigurationError(f"provider {provider_name!r} is denied by configuration")
-        selected_model = role_model_for_request(config, normalized) or route.model or default_model_for_request(config, normalized)
+        if route.model_source == "manual":
+            selected_model = route.model or role_model_for_request(config, normalized) or default_model_for_request(config, normalized)
+        else:
+            selected_model = role_model_for_request(config, normalized) or route.model or default_model_for_request(config, normalized)
         try:
             provider = build_provider(config)
             if budget_hard_stop_for_request(normalized, config, selected_model):
