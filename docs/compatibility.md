@@ -154,7 +154,7 @@ built-in DeepSeek, OpenAI-compatible, and Ollama adapters. See
 
 | Primary Agent | Status | Notes |
 |---|---|---|
-| Codex | Tested | Full `exec_command` tool loop, streaming, multi-turn |
+| Codex | Tested | Tested with OpenAI Codex v0.128.0 and v0.130.0 for the `/v1/responses` custom provider integration. Provider config injection, `wire_api = "responses"`, streaming SSE, function-tool loop handling, and installed router agent roles are covered by automated and mock smoke tests. The app-server/desktop SDK protocol is not treated as a stable integration surface. |
 | Claude Code | Possible via stdio | Requires a Claude Code wrapper around `subagent-router stdio` |
 | Generic CLI | Implemented | `subagent-router stdio` reads one request and writes one response |
 

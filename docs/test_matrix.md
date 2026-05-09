@@ -426,6 +426,42 @@ x Run `subagent-router run -- codex ...` and verify temporary provider
   overrides are injected and secret environment variables are stripped from the
   child process.
 
+#### Codex v0.130.0 Compatibility Smoke
+
+Validated against installed `codex-cli 0.130.0` with package version `0.2.4`.
+Compatibility scope: OpenAI Codex custom model provider over local
+`/v1/responses`, not app-server or desktop SDK internals. Codex v0.128.0 and
+v0.130.0 are the currently recorded tested versions for this integration.
+
+Commands and results:
+
+- `codex --version` -> `codex-cli 0.130.0`
+- `python --version` -> `Python 3.12.3`
+- `python -m pytest -q` -> 216 passed
+- `UV_CACHE_DIR=/tmp/subagent-router-uv-cache uv run pytest -q` -> 216 passed,
+  7 subtests passed
+- `subagent-router doctor --mock` -> passed
+- `subagent-router validate-artifacts` -> passed
+- `git diff --check` -> passed
+- `subagent-router start --mock --state-dir /tmp/subagent-router-codex-0130-smoke-fg --port 18788`
+  plus `curl -sS http://127.0.0.1:18788/health` -> passed
+- Non-streaming `POST /v1/responses` to the mock router -> returned a
+  Responses object with assistant output and provider metadata
+- Streaming `POST /v1/responses` to the mock router -> emitted
+  `response.created`, `response.output_item.done`, and `response.completed`
+- Function-tool-shaped `POST /v1/responses` with `exec_command` -> returned a
+  `function_call` item with `call_id = "call_mock_1"` and `end_turn = false`
+- Follow-up `POST /v1/responses` with `previous_response_id` and
+  `function_call_output` -> accepted and returned a valid Responses object
+- `subagent-router init --codex-home /tmp/subagent-router-codex-home-0130 --profile cost-optimization`
+  -> wrote `AGENTS.md`, `SUBAGENT_ROUTER_INSTRUCTIONS.md`, all three
+  `agents/subagent-router-*.toml` role files, manifest, and a managed
+  `[model_providers.subagent_router]` block using
+  `base_url = "http://127.0.0.1:8787/v1"` and `wire_api = "responses"`
+- `CODEX_HOME=/tmp/subagent-router-codex-home-0130 subagent-router run --mock --state-dir /tmp/subagent-router-codex-run-0130 -- codex exec --skip-git-repo-check --ephemeral --ignore-rules -c model_provider="subagent_router" -m deepseek-chat "Reply with exactly: router-smoke-ok"`
+  -> passed; Codex reported provider `subagent_router` and returned
+  `router-smoke-ok`
+
 ### 11. Terminal And Release Tools
 
 x Run `subagent-router tui` against empty state and populated activity/usage
