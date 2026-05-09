@@ -1,12 +1,46 @@
 # Subagent Router
 
+<p align="left">
+  <a href="https://github.com/marikarX/subagent-router/actions/workflows/ci.yml">
+    <img src="https://github.com/marikarX/subagent-router/actions/workflows/ci.yml/badge.svg" alt="CI" />
+  </a>
+  <a href="https://github.com/marikarX/subagent-router/blob/main/LICENSE">
+    <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
+  </a>
+  <a href="https://www.npmjs.com/package/subagent-router">
+    <img src="https://img.shields.io/npm/v/subagent-router.svg" alt="npm" />
+  </a>
+</p>
+
 Route subagent work from primary coding agents to local, low-cost, or cloud model backends.
 
-Subagent Router lets primary coding agents delegate subagent tasks to alternate model backends such as **DeepSeek**, **Ollama**, **Groq**, and other OpenAI-compatible providers. It features a robust routing engine, fallback logic, and granular budget controls to ensure privacy, performance, and cost-efficiency.
+Subagent Router delegates subagent work to alternate model backends such as **DeepSeek**, **Ollama**, **Groq**, and other OpenAI-compatible providers. It adds routing, fallbacks, and budget controls so the parent agent can keep moving without overspending or exposing every task to the same backend.
 
-The current Codex integration talks to this proxy through a local `/v1/responses` HTTP endpoint. The proxy normalizes requests to various backend formats, manages streaming SSE, and tracks usage across tasks, sessions, and days.
+The current Codex integration talks to this proxy through a local `/v1/responses` HTTP endpoint. The proxy normalizes requests to backend-specific formats, manages streaming SSE, and tracks usage across tasks, sessions, and days.
 
 ![TUI](docs/img/TUI.webp)
+
+## At A Glance
+
+- **Best for**: routing subagent work away from the primary coding model
+- **Protocols**: Codex `/v1/responses`, OpenAI-style `/v1/chat/completions`
+- **Backends**: DeepSeek, Ollama, Groq, vLLM, and other OpenAI-compatible providers
+- **Controls**: per-task, per-session, and per-day budget limits
+- **Visibility**: structured activity logs and a lightweight TUI
+
+## Start Here
+
+```shell
+subagent-router doctor
+subagent-router init
+DEEPSEEK_API_KEY=... subagent-router start
+```
+
+If you just want the shortest path from install to use:
+
+1. Run `subagent-router doctor` to verify your environment.
+1. Run `subagent-router init` to install the Codex integration files.
+1. Run `subagent-router start` with the provider credentials you want to use.
 
 ## Install
 
@@ -27,17 +61,17 @@ pip install -e '.[server]'
 
 ## Quick Start
 
-Check your configuration:
+Check your configuration and local paths:
 
 ```shell
 subagent-router doctor
 subagent-router paths
 ```
 
-Install Codex integration files:
+Install Codex integration files. This defaults to the `cost-optimization` profile:
 
 ```shell
-subagent-router init                    # same as --profile cost-optimization
+subagent-router init
 ```
 
 Start the proxy:
@@ -59,16 +93,15 @@ DEEPSEEK_API_KEY=... subagent-router run -- codex
 
 ## Features
 
-- **Multi-Provider Routing**: Seamlessly switch between DeepSeek, local Ollama, and OpenAI-compatible endpoints (Groq, vLLM, etc.).
-- **Smart Fallbacks**: Automatically retry failed requests on alternative backends.
-- **Budget Controls**: Hard-stop or warn based on token usage or dollar cost per-task, per-session, or per-day.
-- **Observability**: Structured audit logs with deep token tracking (in/cache/out), real-time usage tracking, and a lightweight interactive Terminal UI (`tui`).
-- **Protocol Flexibility**: First-class support for the Codex internal Responses protocol, while also transparently accepting standard OpenAI `/v1/chat/completions` `messages` payloads for drop-in compatibility with curl and standard libraries.
+- **Multi-provider routing**: switch between DeepSeek, local Ollama, and OpenAI-compatible endpoints.
+- **Fallbacks**: retry failed requests on alternate backends.
+- **Budget controls**: warn or hard-stop based on token usage or dollar cost per task, session, or day.
+- **Observability**: structured audit logs with token tracking, real-time usage metrics, and a lightweight `tui`.
+- **Protocol flexibility**: accept Codex Responses requests and standard OpenAI chat-completions payloads.
 
 ## Delegation Profiles
 
-Installation profiles control how router subagents are used by the parent coding agent.
-Pass `--profile` to `subagent-router init` to select one:
+Installation profiles control how router subagents are used by the parent coding agent. Pass `--profile` to `subagent-router init` to select one:
 
 | Profile | Default | Parent model role | Delegation style |
 |---|---|---|---|
