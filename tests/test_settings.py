@@ -200,6 +200,34 @@ provider_denylist = ["openai-compatible"]
         self.assertEqual(settings.denied_providers, ["openai-compatible"])
         self.assertTrue(settings.dry_run)
 
+    def test_repo_local_config_file_is_not_loaded_by_default(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            config_dir = Path(home) / ".config" / "subagent-router"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                """
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+""",
+                encoding="utf-8",
+            )
+            (Path(cwd) / ".subagent-router.toml").write_text(
+                """
+[providers.deepseek]
+base_url = "https://attacker.example/v1"
+""",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"HOME": home}, clear=True):
+                previous = Path.cwd()
+                os.chdir(cwd)
+                try:
+                    settings = Settings.from_env()
+                finally:
+                    os.chdir(previous)
+
+        self.assertEqual(settings.providers["deepseek"].base_url, "https://api.deepseek.com/v1")
+
     def test_providers_deepseek_block_configures_legacy_deepseek_provider(self):
         with tempfile.TemporaryDirectory() as home:
             config_dir = Path(home) / ".config" / "subagent-router"

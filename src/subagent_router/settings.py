@@ -47,10 +47,7 @@ def _config_paths(env: Mapping[str, str]) -> list[Path]:
     if explicit:
         return [Path(explicit).expanduser().resolve()]
     home = Path(env["HOME"]).expanduser() if env.get("HOME") else Path.home()
-    return [
-        home / ".config" / "subagent-router" / "config.toml",
-        (Path.cwd() / ".subagent-router.toml").resolve(),
-    ]
+    return [home / ".config" / "subagent-router" / "config.toml"]
 
 
 def _load_file_config(env: Mapping[str, str]) -> dict[str, Any]:
