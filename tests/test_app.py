@@ -580,7 +580,7 @@ class AppTests(unittest.TestCase):
             )
         )
 
-    def test_call_provider_prefers_explorer_role_model_over_policy_model(self):
+    def test_call_provider_prefers_policy_model_over_explorer_role_model(self):
         from fastapi.testclient import TestClient
 
         class CaptureProvider:
@@ -605,6 +605,8 @@ class AppTests(unittest.TestCase):
             worker_model="worker-model",
         )
         proxy_app.SETTINGS.provider = "deepseek"
+        original_safe_default_policy = proxy_app.SETTINGS.routing_policies.get("safe-default")
+        proxy_app.SETTINGS.routing_policies["safe-default"] = {"model": "cheap-policy-model"}
         proxy_app.build_provider = lambda config: CaptureProvider()
         try:
             response = TestClient(proxy_app.app).post(
@@ -619,9 +621,13 @@ class AppTests(unittest.TestCase):
             )
         finally:
             proxy_app.build_provider = original_build_provider
+            if original_safe_default_policy is None:
+                proxy_app.SETTINGS.routing_policies.pop("safe-default", None)
+            else:
+                proxy_app.SETTINGS.routing_policies["safe-default"] = original_safe_default_policy
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["metadata"]["provider_model"], "cheap-explorer")
+        self.assertEqual(response.json()["metadata"]["provider_model"], "cheap-policy-model")
 
     def test_manual_model_override_wins_over_role_model(self):
         """Manual provider/model override should win over role-specific model selection."""
