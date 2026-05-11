@@ -724,10 +724,7 @@ async def call_provider(normalized: NormalizedRequest, route: RouteSelection) ->
         if provider_name in SETTINGS.denied_providers:
             route.attempts.append({"provider": provider_name, "status": "blocked", "error": "denylisted"})
             raise ProviderConfigurationError(f"provider {provider_name!r} is denied by configuration")
-        if route.model_source == "manual":
-            selected_model = route.model or role_model_for_request(config, normalized) or default_model_for_request(config, normalized)
-        else:
-            selected_model = role_model_for_request(config, normalized) or route.model or default_model_for_request(config, normalized)
+        selected_model = route.model or role_model_for_request(config, normalized) or default_model_for_request(config, normalized)
         try:
             provider = build_provider(config)
             if budget_hard_stop_for_request(normalized, config, selected_model):
