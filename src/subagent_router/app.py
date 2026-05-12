@@ -1492,24 +1492,6 @@ async def patch_config(request: Request) -> JSONResponse:
     return JSONResponse({"status": "no changes"})
 
 
-@app.post("/v1/reset")
-async def reset_usage_stats() -> JSONResponse:
-    ACTIVITY_STATE.clear()
-    ACTIVITY_STATE.update(default_activity_state())
-    
-    # Clear tracking files
-    try:
-        if SETTINGS.usage_file.exists():
-            SETTINGS.usage_file.write_text("{}", encoding="utf-8")
-        if SETTINGS.usage_jsonl_file.exists():
-            SETTINGS.usage_jsonl_file.write_text("", encoding="utf-8")
-        if SETTINGS.audit_log_file.exists():
-            SETTINGS.audit_log_file.write_text("", encoding="utf-8")
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
-        
-    return JSONResponse({"status": "reset"})
-
 
 @app.get("/v1/check-provider/{name}")
 async def check_provider(name: str) -> dict[str, Any]:
