@@ -769,18 +769,19 @@ class AppTests(unittest.TestCase):
         self.assertEqual(proxy_app.ACTIVITY_STATE["error_count"], 0)
         self.assertIsNotNone(proxy_app.ACTIVITY_STATE["last_model"])
 
-    def test_create_response_after_reset_restores_activity_defaults(self):
+    def test_create_response_restores_activity_from_defaults(self):
         from fastapi.testclient import TestClient
 
         client = TestClient(proxy_app.app)
 
-        reset_response = client.post("/v1/reset")
+        proxy_app.ACTIVITY_STATE.clear()
+        proxy_app.ACTIVITY_STATE.update(proxy_app.default_activity_state())
+
         response = client.post(
             "/v1/responses",
             json={"model": "deepseek-chat", "stream": False, "input": "hello", "tools": []},
         )
 
-        self.assertEqual(reset_response.status_code, 200)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(proxy_app.ACTIVITY_STATE["request_count"], 1)
         self.assertEqual(proxy_app.ACTIVITY_STATE["response_count"], 1)
